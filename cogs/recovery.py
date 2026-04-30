@@ -14,6 +14,7 @@
 # ══════════════════════════════════════════════════════════════════
 
 import json
+import asyncio
 import discord
 from discord.ext import commands, tasks
 
@@ -344,6 +345,9 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
             except discord.HTTPException as e:
                 failed.append(f"{role_data['name']} ({e})")
 
+            # M-3 fix: avoid Discord API rate limits
+            await asyncio.sleep(0.5)
+
         # Result embed
         result_embed = discord.Embed(
             title="🔄 Role Restoration Complete",
@@ -551,6 +555,9 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
                 failed.append(ch_data["name"])
             except discord.HTTPException as e:
                 failed.append(f"{ch_data['name']} ({e})")
+
+            # M-3 fix: avoid Discord API rate limits
+            await asyncio.sleep(0.5)
 
         # Result embed
         result_embed = discord.Embed(

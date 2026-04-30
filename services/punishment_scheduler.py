@@ -69,10 +69,7 @@ async def _lift_expired_punishments(bot) -> None:
                 elif punishment_type == "mute":
                     await _lift_mute(guild, user_id)
                 elif punishment_type == "quarantine":
-                    # Quarantine lift requires role restoration — Phase 2
-                    logger.debug(
-                        f"Quarantine lift for user {user_id} — not yet implemented"
-                    )
+                    await _lift_quarantine(bot, guild, user_id, punishment_id)
 
                 # Mark as inactive in DB
                 await _deactivate_punishment(bot.db.pool, punishment_id)
@@ -120,6 +117,77 @@ async def _lift_mute(guild: discord.Guild, user_id: int) -> None:
             await member.timeout(None, reason="[AntiRaid] Temporary mute expired")
         except discord.NotFound:
             pass  # User left the guild
+
+
+async def _lift_quarantine(bot, guild: discord.Guild, user_id: int, punishment_id: int) -> None:
+    """
+    Lift a quarantine: remove the quarantine role and restore saved roles.
+
+    When a user is quarantined, their existing roles are stripped and saved
+    in the temporal_punishments.reason field as a JSON-encoded list of role IDs.
+    This function reverses that process.
+    """
+    # Fetch the member
+    member = guild.get_member(user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return  # User left the guild
+
+    # Fetch the punishment details to get saved role IDs
+    saved_role_ids: list[int] = []
+    if bot.db.pool:
+        row = await bot.db.pool.fetchrow(
+            "SELECT reason FROM temporal_punishments WHERE id = $1",
+            punishment_id,
+        )
+        if row and row["reason"]:
+            try:
+                import json
+                data = json.loads(row["reason"])
+                if isinstance(data, dict):
+                    saved_role_ids = data.get("saved_roles", [])
+                elif isinstance(data, list):
+                    saved_role_ids = data
+            except (json.JSONDecodeError, TypeError):
+                pass  # reason is plain text, not JSON — no roles to restore
+
+    # Remove the quarantine role
+    config_row = await bot.db.pool.fetchrow(
+        "SELECT quarantine_role_id FROM server_configs WHERE guild_id = $1",
+        guild.id,
+    )
+    if config_row and config_row["quarantine_role_id"]:
+        quarantine_role = guild.get_role(config_row["quarantine_role_id"])
+        if quarantine_role and quarantine_role in member.roles:
+            try:
+                await member.remove_roles(
+                    quarantine_role, reason="[AntiRaid] Quarantine expired"
+                )
+            except discord.Forbidden:
+                logger.warning(f"Cannot remove quarantine role from {member}")
+
+    # Restore saved roles
+    if saved_role_ids:
+        roles_to_restore = []
+        for role_id in saved_role_ids:
+            role = guild.get_role(role_id)
+            if role and not role.is_default() and role < guild.me.top_role:
+                roles_to_restore.append(role)
+
+        if roles_to_restore:
+            try:
+                await member.add_roles(
+                    *roles_to_restore,
+                    reason="[AntiRaid] Roles restored after quarantine expired",
+                )
+                logger.info(
+                    f"🔄 Restored {len(roles_to_restore)} role(s) for {member} "
+                    f"after quarantine lift"
+                )
+            except discord.Forbidden:
+                logger.warning(f"Cannot restore roles for {member} — missing permissions")
 
 
 async def _deactivate_punishment(pool, punishment_id: int) -> None:

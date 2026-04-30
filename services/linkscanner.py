@@ -149,11 +149,13 @@ def extract_urls(content: str) -> list[str]:
 #    3. Result caching — ALL results (clean + malicious) persisted to DB
 # ══════════════════════════════════════════════════════════════════
 
-# Minimum number of VT engines that must flag a URL as malicious
-VT_MALICIOUS_THRESHOLD = 1
+# Minimum number of VT engines that must flag a URL as malicious.
+# Set to 3 to avoid false positives from single-engine flags.
+VT_MALICIOUS_THRESHOLD = 3
 
-# VT free tier: 4 lookups per minute
+# VT free tier: 4 lookups per minute, 500 per day
 VT_RATE_LIMIT = 4
+VT_DAILY_QUOTA = 490  # Leave 10 call margin for safety
 
 
 async def check_virustotal(url: str) -> int:
@@ -164,6 +166,7 @@ async def check_virustotal(url: str) -> int:
       1. Extract domain from URL.
       2. Check vt_scan_cache DB — if domain was scanned before, return cached result.
       3. Check Redis rate limiter — if over 4 calls/minute, skip (fail open).
+      3b. Check Redis daily quota — if over 490 calls/day, skip (fail open).
       4. Call VT API.
       5. Cache the result in vt_scan_cache (clean OR malicious).
       6. If malicious, also insert into malicious_links + in-memory cache.
@@ -218,6 +221,23 @@ async def check_virustotal(url: str) -> int:
                 return 0  # Fail open — don't block the message
         except Exception as e:
             logger.debug(f"VT rate limit check failed: {e}")
+
+    # ── Step 3b: Daily quota check (490/day) ───────────────────
+    if _redis:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            daily_key = f"vt:daily:{_dt.now(_tz.utc).strftime('%Y-%m-%d')}"
+            daily_count = await _redis.incr(daily_key)
+            if daily_count == 1:
+                await _redis.expire(daily_key, 86400)
+            if daily_count > VT_DAILY_QUOTA:
+                logger.warning(
+                    f"⚠️ VT daily quota reached ({daily_count}/{VT_DAILY_QUOTA}) — "
+                    f"skipping {domain}"
+                )
+                return 0  # Fail open
+        except Exception as e:
+            logger.debug(f"VT daily quota check failed: {e}")
 
     # ── Step 4: Call VT API ────────────────────────────────────
     try:
