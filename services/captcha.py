@@ -129,17 +129,19 @@ def _create_captcha_image(code: str) -> io.BytesIO:
     # ── Draw more noise arcs over the text ─────────────────────
     draw = ImageDraw.Draw(img)
     for _ in range(random.randint(2, 4)):
-        x1 = random.randint(-20, IMAGE_WIDTH // 2)
-        y1 = random.randint(-20, IMAGE_HEIGHT)
-        x2 = random.randint(IMAGE_WIDTH // 2, IMAGE_WIDTH + 20)
-        y2 = random.randint(-20, IMAGE_HEIGHT)
+        # x0 < x1 guaranteed by using separate non-overlapping ranges
+        x0 = random.randint(-20, IMAGE_WIDTH // 2)
+        x1 = random.randint(IMAGE_WIDTH // 2, IMAGE_WIDTH + 20)
+        # y0 capped so y1 = y0 + gap is always valid (Pillow requires y1 >= y0)
+        y0 = random.randint(-10, IMAGE_HEIGHT - 20)
+        y1 = y0 + random.randint(20, IMAGE_HEIGHT // 2)
         arc_color = (
             random.randint(60, 160),
             random.randint(60, 160),
             random.randint(60, 160),
         )
         draw.arc(
-            [(x1, y1), (x2, y2)],
+            [(x0, y0), (x1, y1)],
             start=random.randint(0, 90),
             end=random.randint(180, 360),
             fill=arc_color,
