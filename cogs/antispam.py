@@ -17,8 +17,13 @@ import logging
 import time
 from collections import deque, defaultdict
 from datetime import timedelta
-
 from utils.threat_data import ZALGO_RE
+
+INVITE_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?discord(?:(?:app)?\.com/invite|\.gg(?:/invite)?)'
+    r'/[\w-]{2,255}',
+    re.IGNORECASE,
+)
 from utils.rate_limit import check_spam
 from services.linkscanner import scan_message_urls
 
@@ -62,13 +67,14 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             "max_mentions": DEFAULT_MAX_MENTIONS,
             "spam_msg_limit": DEFAULT_SPAM_MSG_LIMIT,
             "spam_msg_seconds": DEFAULT_SPAM_MSG_SECONDS,
+            "allow_invites": False,
         }
 
         if self.bot.db.pool:
             row = await self.bot.db.pool.fetchrow(
                 """
                 SELECT antispam_enabled, max_mentions,
-                       spam_msg_limit, spam_msg_seconds
+                       spam_msg_limit, spam_msg_seconds, allow_invites
                 FROM server_configs
                 WHERE guild_id = $1
                 """,
@@ -79,6 +85,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                 config["max_mentions"] = row["max_mentions"]
                 config["spam_msg_limit"] = row["spam_msg_limit"]
                 config["spam_msg_seconds"] = row["spam_msg_seconds"]
+                config["allow_invites"] = row.get("allow_invites", False)
 
         self._config_cache[guild_id] = config
         return config
@@ -319,6 +326,37 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                 member=member,
             )
             return
+
+        # ══════════════════════════════════════════════════════════
+        #  CHECK 2.5: Discord Invite Link Detection
+        # ══════════════════════════════════════════════════════════
+        if INVITE_RE.search(message.content):
+            if not config.get("allow_invites", False):
+                try:
+                    await message.delete()
+                except discord.Forbidden:
+                    pass
+                logger.info(
+                    f"Invite link blocked from {member} ({member.id}) "
+                    f"in #{message.channel.name}"
+                )
+                await self._auto_mute(
+                    member=member,
+                    guild=message.guild,
+                    reason="Unauthorized Discord invite link",
+                )
+                await self._send_alert(
+                    guild=message.guild,
+                    title="🔗 Invite Link Blocked",
+                    description=(
+                        f"{member.mention} posted a Discord invite link "
+                        f"in {message.channel.mention}.\n"
+                        f"**Action:** Message deleted + auto-muted."
+                    ),
+                    member=member,
+                    color=discord.Color.orange(),
+                )
+                return
 
         # ══════════════════════════════════════════════════════════
         #  CHECK 3: Mass Mention Detection

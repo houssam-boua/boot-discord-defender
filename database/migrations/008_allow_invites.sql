@@ -1,0 +1,2 @@
+ALTER TABLE server_configs
+    ADD COLUMN IF NOT EXISTS allow_invites BOOLEAN DEFAULT FALSE;

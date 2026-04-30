@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from security.audit_integrity import insert_audit_log
 from services.captcha import generate_captcha
+from services.proxycheck import check_ip, is_suspicious_ip
 
 logger = logging.getLogger("antiraid.verification")
 
@@ -41,9 +42,6 @@ class Verification(commands.Cog, name="🔑 Verification"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # Track active CAPTCHA sessions to prevent duplicates
-        # Key: (guild_id, user_id) → True
-        self._active_sessions: dict[tuple[int, int], bool] = {}
 
     # ══════════════════════════════════════════════════════════════
     #  Helper: Fetch guild verification config from DB
@@ -178,6 +176,15 @@ class Verification(commands.Cog, name="🔑 Verification"):
         #  STEP 2: CAPTCHA Flow (if enabled)
         # ══════════════════════════════════════════════════════════
 
+        # STEP 1.5: IP Reputation Hook (activated by web-gate integration)
+        ip_address: str | None = None  # Populated by web-gate when available
+        if await self._check_ip_reputation(member, ip_address, config):
+            try:
+                await member.kick(reason="[AntiRaid] VPN/Proxy/Tor detected")
+            except discord.Forbidden:
+                pass
+            return
+
         if not config["captcha_enabled"]:
             # CAPTCHA disabled — log the join and let them through
             await insert_audit_log(
@@ -194,15 +201,74 @@ class Verification(commands.Cog, name="🔑 Verification"):
             return
 
         # Prevent duplicate CAPTCHA sessions
-        session_key = (guild.id, member.id)
-        if session_key in self._active_sessions:
-            return
-        self._active_sessions[session_key] = True
-
+        pool = self.bot.db.pool
+        if pool:
+            existing = await pool.fetchrow(
+                """SELECT id, completed FROM captcha_challenges
+                   WHERE guild_id = $1 AND user_id = $2""",
+                guild.id, member.id,
+            )
+            if existing and not existing["completed"]:
+                return  # Active session exists — no duplicate
         try:
             await self._run_captcha_flow(member, config)
         finally:
-            self._active_sessions.pop(session_key, None)
+            if pool:
+                try:
+                    await pool.execute(
+                        """DELETE FROM captcha_challenges
+                           WHERE guild_id = $1 AND user_id = $2""",
+                        guild.id, member.id,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to clean CAPTCHA session: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  IP Reputation Hook
+    # ══════════════════════════════════════════════════════════════
+
+    async def _check_ip_reputation(
+        self,
+        member: discord.Member,
+        ip_address: str | None,
+        config: dict,
+    ) -> bool:
+        """
+        IP reputation check via Proxycheck.io.
+        ip_address is None in the pure Discord flow — Discord never exposes IPs.
+        Wire a web-gate (OAuth2 callback page) to supply the real IP later.
+        Returns True if suspicious (caller should kick). Fails open on error.
+        """
+        if not ip_address:
+            return False
+        api_key = getattr(self.bot.config, "PROXYCHECK_API_KEY", None)
+        if not api_key:
+            logger.warning("PROXYCHECK_API_KEY not set — skipping IP check")
+            return False
+        try:
+            result = await check_ip(ip_address, api_key)
+            suspicious = is_suspicious_ip(result)
+            if suspicious:
+                proxy_type = result.get(ip_address, {}).get("type", "unknown")
+                pool = self.bot.db.pool
+                if pool:
+                    await insert_audit_log(
+                        pool=pool,
+                        guild_id=member.guild.id,
+                        actor_id=self.bot.user.id,
+                        target_id=member.id,
+                        action_type="KICK_PROXY_IP",
+                        details={
+                            "ip": ip_address,
+                            "proxy_type": proxy_type,
+                            "risk_score": result.get(ip_address, {}).get("risk", 0),
+                        },
+                        severity="WARN",
+                    )
+            return suspicious
+        except Exception as e:
+            logger.error(f"Proxycheck error for {member}: {e}")
+            return False  # Always fail open
 
     # ══════════════════════════════════════════════════════════════
     #  Alt-Account Kick
@@ -307,6 +373,24 @@ class Verification(commands.Cog, name="🔑 Verification"):
         # ── Generate the CAPTCHA ───────────────────────────────
         code, captcha_file = generate_captcha()
 
+        pool = self.bot.db.pool
+        if pool:
+            try:
+                await pool.execute(
+                    """INSERT INTO captcha_challenges
+                           (guild_id, user_id, answer, expires_at)
+                       VALUES ($1, $2, $3, NOW() + $4::interval)
+                       ON CONFLICT (guild_id, user_id)
+                       DO UPDATE SET answer = EXCLUDED.answer,
+                                     attempts = 0,
+                                     expires_at = EXCLUDED.expires_at,
+                                     completed = FALSE""",
+                    guild.id, member.id, code,
+                    f"{CAPTCHA_TIMEOUT_SECONDS} seconds",
+                )
+            except Exception as e:
+                logger.error(f"Failed to persist CAPTCHA challenge: {e}")
+
         challenge_embed = discord.Embed(
             title="🔑 CAPTCHA Verification Required",
             description=(
@@ -409,6 +493,12 @@ class Verification(commands.Cog, name="🔑 Verification"):
 
                 if response.content.strip().upper() == code.upper():
                     verified = True
+                    if pool:
+                        await pool.execute(
+                            "UPDATE captcha_challenges SET completed = TRUE "
+                            "WHERE guild_id = $1 AND user_id = $2",
+                            guild.id, member.id,
+                        )
                     break
                 else:
                     attempts += 1
@@ -424,6 +514,13 @@ class Verification(commands.Cog, name="🔑 Verification"):
                             color=discord.Color.orange(),
                         )
                         await (listen_channel).send(embed=retry_embed)
+
+                    if pool:
+                        await pool.execute(
+                            "UPDATE captcha_challenges SET attempts = attempts + 1 "
+                            "WHERE guild_id = $1 AND user_id = $2",
+                            guild.id, member.id,
+                        )
 
             except asyncio.TimeoutError:
                 # Timed out — treat as failure
