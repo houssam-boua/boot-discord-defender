@@ -12,7 +12,7 @@
 
 import discord
 from discord.ext import commands
-
+import re
 import logging
 import time
 from collections import deque, defaultdict
