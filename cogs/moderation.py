@@ -138,15 +138,17 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
         duration: timedelta,
         reason: str,
         issued_by: int,
+        details: dict | None = None,
     ) -> None:
         """Insert a temporal punishment record into the database."""
         expires_at = datetime.now(timezone.utc) + duration
+        details_json = json.dumps(details) if details else '{}'
 
         await self.bot.db.pool.execute(
             """
             INSERT INTO temporal_punishments
-                (guild_id, user_id, punishment_type, expires_at, reason, issued_by)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (guild_id, user_id, punishment_type, expires_at, reason, issued_by, details)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             """,
             guild_id,
             user_id,
@@ -154,6 +156,7 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
             expires_at,
             reason,
             issued_by,
+            details_json,
         )
 
     # ══════════════════════════════════════════════════════════════
@@ -851,8 +854,10 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
             await ctx.send("❌ Quarantine role no longer exists.")
             return
 
-        # Save current roles to Redis for !unquarantine
+        # Save current roles for restoration
         saved_role_ids = [r.id for r in member.roles if r != ctx.guild.default_role]
+
+        # Save to Redis for instant !unquarantine access
         if self.bot.redis:
             await self.bot.redis.set(
                 f"quarantine_roles:{ctx.guild.id}:{member.id}",
@@ -869,6 +874,18 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
         except discord.Forbidden:
             await ctx.send("❌ Missing permissions to modify this user's roles.")
             return
+
+        # Persist to temporal_punishments with saved roles in details JSONB
+        # This ensures the scheduler can restore roles even after a Redis restart.
+        await self._insert_punishment(
+            guild_id=ctx.guild.id,
+            user_id=member.id,
+            punishment_type="quarantine",
+            duration=timedelta(days=365 * 10),  # Indefinite — lifted manually or by scheduler
+            reason=f"Quarantined by {ctx.author}",
+            issued_by=ctx.author.id,
+            details={"saved_roles": saved_role_ids},
+        )
 
         embed = discord.Embed(
             title="🔒 User Quarantined",

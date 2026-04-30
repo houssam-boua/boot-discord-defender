@@ -49,6 +49,7 @@ class TemporalPunishment:
     punishment_type: str = ""  # "ban" | "mute" | "quarantine"
     expires_at: datetime | None = None
     reason: str | None = None
+    details: dict | None = None
     issued_by: int | None = None
     active: bool = True
     created_at: datetime | None = None

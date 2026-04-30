@@ -124,7 +124,7 @@ async def _lift_quarantine(bot, guild: discord.Guild, user_id: int, punishment_i
     Lift a quarantine: remove the quarantine role and restore saved roles.
 
     When a user is quarantined, their existing roles are stripped and saved
-    in the temporal_punishments.reason field as a JSON-encoded list of role IDs.
+    in the temporal_punishments.details JSONB column as {"saved_roles": [...]}.
     This function reverses that process.
     """
     # Fetch the member
@@ -139,19 +139,17 @@ async def _lift_quarantine(bot, guild: discord.Guild, user_id: int, punishment_i
     saved_role_ids: list[int] = []
     if bot.db.pool:
         row = await bot.db.pool.fetchrow(
-            "SELECT reason FROM temporal_punishments WHERE id = $1",
+            "SELECT details FROM temporal_punishments WHERE id = $1",
             punishment_id,
         )
-        if row and row["reason"]:
-            try:
+        if row and row["details"]:
+            details = row["details"]
+            # asyncpg auto-parses JSONB into a dict, but handle string fallback
+            if isinstance(details, str):
                 import json
-                data = json.loads(row["reason"])
-                if isinstance(data, dict):
-                    saved_role_ids = data.get("saved_roles", [])
-                elif isinstance(data, list):
-                    saved_role_ids = data
-            except (json.JSONDecodeError, TypeError):
-                pass  # reason is plain text, not JSON — no roles to restore
+                details = json.loads(details)
+            if isinstance(details, dict):
+                saved_role_ids = details.get("saved_roles", [])
 
     # Remove the quarantine role
     config_row = await bot.db.pool.fetchrow(
