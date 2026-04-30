@@ -19,7 +19,7 @@ from discord.ext import commands
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from security.audit_integrity import insert_audit_log
 from services.captcha import generate_captcha
@@ -379,14 +379,14 @@ class Verification(commands.Cog, name="🔑 Verification"):
                 await pool.execute(
                     """INSERT INTO captcha_challenges
                            (guild_id, user_id, answer, expires_at)
-                       VALUES ($1, $2, $3, NOW() + $4::interval)
+                       VALUES ($1, $2, $3, NOW() + $4)
                        ON CONFLICT (guild_id, user_id)
                        DO UPDATE SET answer = EXCLUDED.answer,
                                      attempts = 0,
                                      expires_at = EXCLUDED.expires_at,
                                      completed = FALSE""",
                     guild.id, member.id, code,
-                    f"{CAPTCHA_TIMEOUT_SECONDS} seconds",
+                    timedelta(seconds=CAPTCHA_TIMEOUT_SECONDS),
                 )
             except Exception as e:
                 logger.error(f"Failed to persist CAPTCHA challenge: {e}")
