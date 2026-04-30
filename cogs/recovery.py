@@ -65,8 +65,28 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
     @snapshot_loop.before_loop
     async def before_snapshot_loop(self) -> None:
-        """Wait until the bot is ready before starting the loop."""
+        """
+        Wait until the bot is ready, then take a baseline snapshot
+        of every guild immediately. This ensures !restore commands
+        are functional from the moment the bot comes online, instead
+        of waiting 24 hours for the first loop iteration.
+        """
         await self.bot.wait_until_ready()
+
+        if not self.bot.db.pool:
+            return
+
+        logger.info("📸 Taking baseline snapshots for all guilds...")
+        for guild in self.bot.guilds:
+            try:
+                await self._take_snapshot(guild)
+            except Exception as e:
+                logger.error(
+                    f"❌ Baseline snapshot failed for {guild.name} ({guild.id}): {e}"
+                )
+        logger.info(
+            f"📸 Baseline snapshots complete — {len(self.bot.guilds)} guild(s) captured"
+        )
 
     # ══════════════════════════════════════════════════════════════
     #  Core: Take a full structural snapshot of a guild

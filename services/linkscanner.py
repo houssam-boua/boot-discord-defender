@@ -28,6 +28,9 @@ _session: aiohttp.ClientSession | None = None
 # Database pool reference — set at startup by init_pool()
 _pool = None
 
+# Redis reference — set at startup by init_redis()
+_redis = None
+
 
 # ══════════════════════════════════════════════════════════════════
 #  Session & Pool Management
@@ -38,6 +41,12 @@ def init_pool(pool) -> None:
     """Store a reference to the asyncpg pool for VT auto-learn inserts."""
     global _pool
     _pool = pool
+
+
+def init_redis(redis_client) -> None:
+    """Store a reference to the Redis client for VT rate limiting."""
+    global _redis
+    _redis = redis_client
 
 
 def get_session() -> aiohttp.ClientSession:
@@ -133,36 +142,84 @@ def extract_urls(content: str) -> list[str]:
 
 # ══════════════════════════════════════════════════════════════════
 #  Layer 2: VirusTotal v3 API Deep Scan
+#
+#  Three-layer protection against API abuse:
+#    1. vt_scan_cache DB check — returns instantly for ANY previously scanned domain
+#    2. Redis token bucket — enforces 4 requests/minute rate limit
+#    3. Result caching — ALL results (clean + malicious) persisted to DB
 # ══════════════════════════════════════════════════════════════════
 
 # Minimum number of VT engines that must flag a URL as malicious
-# before we consider it a true positive.
 VT_MALICIOUS_THRESHOLD = 1
+
+# VT free tier: 4 lookups per minute
+VT_RATE_LIMIT = 4
 
 
 async def check_virustotal(url: str) -> int:
     """
     Query the VirusTotal v3 API for a URL reputation scan.
 
-    Uses URL identifier (base64-encoded URL without padding) for
-    instant lookups against VT's existing database.
-
-    If VT flags the URL as malicious:
-      1. The domain is auto-inserted into the malicious_links DB table.
-      2. The domain is added to the in-memory cache.
-      This ensures we NEVER burn an API call on the same domain again.
+    Execution flow:
+      1. Extract domain from URL.
+      2. Check vt_scan_cache DB — if domain was scanned before, return cached result.
+      3. Check Redis rate limiter — if over 4 calls/minute, skip (fail open).
+      4. Call VT API.
+      5. Cache the result in vt_scan_cache (clean OR malicious).
+      6. If malicious, also insert into malicious_links + in-memory cache.
 
     Args:
         url: The full URL string to scan.
 
     Returns:
         Number of engines that flagged the URL as malicious.
-        Returns 0 if the API key is not set, API fails, or URL is clean.
+        Returns 0 if cached clean, rate-limited, API fails, or key not set.
     """
     api_key = Config.VIRUSTOTAL_API_KEY
     if not api_key:
         return 0
 
+    # ── Step 1: Extract domain ─────────────────────────────────
+    domain = _extract_domain(url)
+    if not domain:
+        return 0
+
+    # ── Step 2: Check DB cache (vt_scan_cache) ─────────────────
+    # This catches BOTH previously-clean and previously-malicious domains
+    if _pool:
+        try:
+            cached = await _pool.fetchrow(
+                "SELECT is_malicious, positives FROM vt_scan_cache WHERE domain = $1",
+                domain,
+            )
+            if cached:
+                if cached["is_malicious"]:
+                    logger.debug(f"VT cache HIT (malicious): {domain}")
+                    return cached["positives"]
+                else:
+                    logger.debug(f"VT cache HIT (clean): {domain}")
+                    return 0
+        except Exception as e:
+            logger.debug(f"VT cache check failed: {e}")
+
+    # ── Step 3: Redis rate limiter (4 per minute) ──────────────
+    if _redis:
+        try:
+            import time
+            current_minute = int(time.time() // 60)
+            rate_key = f"vt:ratelimit:{current_minute}"
+            count = await _redis.incr(rate_key)
+            if count == 1:
+                await _redis.expire(rate_key, 60)
+            if count > VT_RATE_LIMIT:
+                logger.debug(
+                    f"VT rate limit reached ({count}/{VT_RATE_LIMIT}/min) — skipping {domain}"
+                )
+                return 0  # Fail open — don't block the message
+        except Exception as e:
+            logger.debug(f"VT rate limit check failed: {e}")
+
+    # ── Step 4: Call VT API ────────────────────────────────────
     try:
         session = get_session()
 
@@ -174,9 +231,13 @@ async def check_virustotal(url: str) -> int:
 
         async with session.get(vt_url, headers=headers) as resp:
             if resp.status == 404:
-                # URL not in VT database — submit it for scanning
-                # (results will be available on next check)
+                # URL not in VT database — submit for scanning, cache as clean
                 await _submit_url_to_vt(url, headers)
+                await _cache_vt_result(domain, is_malicious=False, positives=0)
+                return 0
+
+            if resp.status == 429:
+                logger.warning("VT API rate limited (429) — backing off")
                 return 0
 
             if resp.status != 200:
@@ -196,11 +257,13 @@ async def check_virustotal(url: str) -> int:
         suspicious = stats.get("suspicious", 0)
         total_flagged = malicious + suspicious
 
-        if total_flagged >= VT_MALICIOUS_THRESHOLD:
-            # Auto-learn: persist to DB and add to memory cache
-            domain = _extract_domain(url)
-            if domain:
-                await _auto_learn_domain(domain, total_flagged)
+        # ── Step 5: Cache result (clean OR malicious) ──────────
+        is_malicious = total_flagged >= VT_MALICIOUS_THRESHOLD
+        await _cache_vt_result(domain, is_malicious=is_malicious, positives=total_flagged)
+
+        if is_malicious:
+            # Step 6: Also insert into malicious_links + memory cache
+            await _auto_learn_domain(domain, total_flagged)
 
             logger.warning(
                 f"🔗 VT Layer 2 FLAGGED: {url} — "
@@ -230,6 +293,31 @@ async def _submit_url_to_vt(url: str, headers: dict) -> None:
                 logger.debug(f"Submitted {url} to VT for analysis")
     except Exception:
         pass  # Non-critical — silently fail
+
+
+async def _cache_vt_result(domain: str, *, is_malicious: bool, positives: int) -> None:
+    """
+    Cache a VT scan result (clean OR malicious) in vt_scan_cache.
+    This is the key to preventing repeated API calls on clean domains.
+    """
+    if not _pool:
+        return
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO vt_scan_cache (domain, is_malicious, positives)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (domain) DO UPDATE
+                SET is_malicious = $2,
+                    positives = $3,
+                    scanned_at = NOW()
+            """,
+            domain,
+            is_malicious,
+            positives,
+        )
+    except Exception as e:
+        logger.debug(f"Failed to cache VT result for {domain}: {e}")
 
 
 async def _auto_learn_domain(domain: str, threat_score: int) -> None:

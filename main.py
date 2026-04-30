@@ -131,9 +131,10 @@ class AntiRaidBot(commands.Bot):
 
         # ── 3. Load link scanner cache from DB ─────────────────
         try:
-            from services.linkscanner import load_cache_from_db, init_pool
+            from services.linkscanner import load_cache_from_db, init_pool, init_redis
             await load_cache_from_db(self.db.pool)
-            init_pool(self.db.pool)  # Phase 4: enable VT auto-learn DB writes
+            init_pool(self.db.pool)    # Phase 4: enable VT auto-learn DB writes
+            init_redis(self.redis)     # Phase 4 patch: enable VT rate limiting
         except Exception as e:
             logger.warning(f"⚠️ Link scanner cache load failed: {e}")
 
