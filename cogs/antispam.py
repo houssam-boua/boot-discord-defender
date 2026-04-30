@@ -272,21 +272,36 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             return  # Message handled — no further checks needed
 
         # ══════════════════════════════════════════════════════════
-        #  CHECK 2: Malicious Link Scanner
+        #  CHECK 2: Malicious Link Scanner (Layer 1 + Layer 2)
         # ══════════════════════════════════════════════════════════
+        # Layer 1: instant in-memory domain cache lookup
         flagged_urls = scan_message_urls(message.content)
+
+        # Layer 2: VirusTotal deep scan for URLs that passed Layer 1
+        if not flagged_urls:
+            from services.linkscanner import extract_urls, check_virustotal
+
+            all_urls = extract_urls(message.content)
+            for url in all_urls[:3]:  # Cap at 3 URLs per message to avoid API abuse
+                vt_score = await check_virustotal(url)
+                if vt_score > 0:
+                    flagged_urls.append(url)
+
         if flagged_urls:
             try:
                 await message.delete()
             except discord.Forbidden:
                 pass
 
+            # Determine source for the alert
+            source = "VirusTotal Layer 2" if not scan_message_urls(message.content) else "Domain Cache"
+
             muted = await self._auto_mute(
                 member, reason=f"Phishing link detected: {flagged_urls[0]}"
             )
 
             logger.warning(
-                f"🔗 Malicious link from {member} ({member.id}): {flagged_urls}"
+                f"🔗 Malicious link from {member} ({member.id}): {flagged_urls} [via {source}]"
             )
 
             action_text = "Message deleted + **User muted**" if muted else "Message deleted"
@@ -296,6 +311,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                 description=(
                     f"{member.mention} posted a malicious link in "
                     f"{message.channel.mention}.\n\n"
+                    f"**Detection:** {source}\n"
                     f"**Flagged URLs:**\n"
                     + "\n".join(f"• `{u}`" for u in flagged_urls[:5])
                     + f"\n\n**Action:** {action_text}"

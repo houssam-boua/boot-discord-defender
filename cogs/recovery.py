@@ -1,0 +1,587 @@
+# ══════════════════════════════════════════════════════════════════
+#  AntiRaid Security Bot — Server Recovery System (Phase 4)
+#
+#  Background Snapshot Engine:
+#    • Every 24 hours, captures a full structural snapshot of every
+#      guild (roles + channels) and persists it to server_snapshots.
+#
+#  Restoration Commands:
+#    • !snapshot-now    — Force an immediate snapshot.
+#    • !restore-roles   — Recreate missing roles from the latest snapshot.
+#    • !restore-channels — Recreate missing channels from the latest snapshot.
+#
+#  All commands require @is_staff() (Administrator permission).
+# ══════════════════════════════════════════════════════════════════
+
+import json
+import discord
+from discord.ext import commands, tasks
+
+import logging
+from datetime import datetime, timezone
+
+from utils.permissions import is_staff
+from security.audit_integrity import insert_audit_log
+
+logger = logging.getLogger("antiraid.recovery")
+
+
+class Recovery(commands.Cog, name="🔄 Recovery"):
+    """
+    Automated server snapshots and post-nuke restoration.
+    Captures role & channel structure every 24 hours and provides
+    admin commands to restore them after destructive attacks.
+    """
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    async def cog_load(self) -> None:
+        """Start the background snapshot loop when the cog loads."""
+        self.snapshot_loop.start()
+        logger.info("✅ Recovery snapshot loop started (interval: 24h)")
+
+    async def cog_unload(self) -> None:
+        """Stop the loop when the cog unloads."""
+        self.snapshot_loop.cancel()
+
+    # ══════════════════════════════════════════════════════════════
+    #  Background Snapshot Engine — runs every 24 hours
+    # ══════════════════════════════════════════════════════════════
+
+    @tasks.loop(hours=24)
+    async def snapshot_loop(self) -> None:
+        """Capture a structural snapshot of every guild."""
+        if not self.bot.db.pool:
+            return
+
+        for guild in self.bot.guilds:
+            try:
+                await self._take_snapshot(guild)
+            except Exception as e:
+                logger.error(
+                    f"❌ Snapshot failed for {guild.name} ({guild.id}): {e}"
+                )
+
+    @snapshot_loop.before_loop
+    async def before_snapshot_loop(self) -> None:
+        """Wait until the bot is ready before starting the loop."""
+        await self.bot.wait_until_ready()
+
+    # ══════════════════════════════════════════════════════════════
+    #  Core: Take a full structural snapshot of a guild
+    # ══════════════════════════════════════════════════════════════
+
+    async def _take_snapshot(self, guild: discord.Guild) -> None:
+        """
+        Capture the current state of all roles and channels in a guild.
+        Stores the result as a JSONB row in server_snapshots.
+        """
+        # ── Serialize Roles ────────────────────────────────────
+        roles_data = []
+        for role in guild.roles:
+            if role.is_default():
+                continue  # Skip @everyone — can't recreate it
+            roles_data.append({
+                "id": role.id,
+                "name": role.name,
+                "color": role.color.value,
+                "permissions": role.permissions.value,
+                "position": role.position,
+                "hoist": role.hoist,
+                "mentionable": role.mentionable,
+            })
+
+        # ── Serialize Channels ─────────────────────────────────
+        channels_data = []
+        for channel in guild.channels:
+            channel_info = {
+                "id": channel.id,
+                "name": channel.name,
+                "type": str(channel.type),
+                "position": channel.position,
+                "category_id": channel.category_id,
+                "category_name": channel.category.name if channel.category else None,
+            }
+
+            # Serialize permission overwrites
+            overwrites = []
+            for target, overwrite in channel.overwrites.items():
+                allow, deny = overwrite.pair()
+                overwrites.append({
+                    "target_id": target.id,
+                    "target_type": "role" if isinstance(target, discord.Role) else "member",
+                    "allow": allow.value,
+                    "deny": deny.value,
+                })
+            channel_info["overwrites"] = overwrites
+
+            # Channel-type-specific attributes
+            if isinstance(channel, discord.TextChannel):
+                channel_info["topic"] = channel.topic
+                channel_info["nsfw"] = channel.nsfw
+                channel_info["slowmode_delay"] = channel.slowmode_delay
+            elif isinstance(channel, discord.VoiceChannel):
+                channel_info["bitrate"] = channel.bitrate
+                channel_info["user_limit"] = channel.user_limit
+
+            channels_data.append(channel_info)
+
+        # ── Build snapshot JSON ────────────────────────────────
+        snapshot = {
+            "roles": roles_data,
+            "channels": channels_data,
+            "guild_name": guild.name,
+            "member_count": guild.member_count,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # ── Persist to database ────────────────────────────────
+        await self.bot.db.pool.execute(
+            """
+            INSERT INTO server_snapshots (guild_id, snapshot_type, data)
+            VALUES ($1, $2, $3::jsonb)
+            """,
+            guild.id,
+            "full",
+            json.dumps(snapshot),
+        )
+
+        logger.info(
+            f"📸 Snapshot saved: {guild.name} — "
+            f"{len(roles_data)} roles, {len(channels_data)} channels"
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    #  !snapshot-now — Force an immediate manual snapshot
+    # ══════════════════════════════════════════════════════════════
+
+    @commands.command(
+        name="snapshot-now",
+        aliases=["snapshotnow", "snapshot"],
+        help="Force an immediate server structure snapshot.",
+    )
+    @is_staff()
+    async def snapshot_now(self, ctx: commands.Context) -> None:
+        """Manually trigger a structural snapshot of the current guild."""
+        if not self.bot.db.pool:
+            await ctx.send("❌ Database is not connected.")
+            return
+
+        msg = await ctx.send(
+            embed=discord.Embed(
+                description="📸 Taking snapshot...",
+                color=discord.Color.blurple(),
+            )
+        )
+
+        try:
+            await self._take_snapshot(ctx.guild)
+
+            embed = discord.Embed(
+                title="📸 Snapshot Saved",
+                description=(
+                    f"A full structural snapshot of **{ctx.guild.name}** has been saved.\n\n"
+                    f"**Roles captured:** {len(ctx.guild.roles) - 1}\n"
+                    f"**Channels captured:** {len(ctx.guild.channels)}\n\n"
+                    f"Use `{ctx.prefix}restore-roles` or `{ctx.prefix}restore-channels` "
+                    f"to restore from this snapshot."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.set_footer(
+                text=f"Triggered by {ctx.author}",
+                icon_url=ctx.author.display_avatar.url,
+            )
+            await msg.edit(embed=embed)
+
+            # Audit log
+            if self.bot.db.pool:
+                await insert_audit_log(
+                    pool=self.bot.db.pool,
+                    guild_id=ctx.guild.id,
+                    actor_id=ctx.author.id,
+                    target_id=None,
+                    action_type="MANUAL_SNAPSHOT",
+                    details={"roles": len(ctx.guild.roles) - 1, "channels": len(ctx.guild.channels)},
+                    severity="INFO",
+                )
+
+        except Exception as e:
+            await msg.edit(
+                embed=discord.Embed(
+                    title="❌ Snapshot Failed",
+                    description=f"An error occurred: `{e}`",
+                    color=discord.Color.red(),
+                )
+            )
+            logger.error(f"Manual snapshot failed for {ctx.guild.name}: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  Helper: Fetch the latest snapshot for a guild
+    # ══════════════════════════════════════════════════════════════
+
+    async def _get_latest_snapshot(self, guild_id: int) -> dict | None:
+        """Fetch the most recent snapshot from the database."""
+        row = await self.bot.db.pool.fetchrow(
+            """
+            SELECT data, created_at
+            FROM server_snapshots
+            WHERE guild_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            guild_id,
+        )
+        if not row:
+            return None
+
+        data = row["data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        data["_created_at"] = row["created_at"]
+        return data
+
+    # ══════════════════════════════════════════════════════════════
+    #  !restore-roles — Recreate missing roles from snapshot
+    # ══════════════════════════════════════════════════════════════
+
+    @commands.command(
+        name="restore-roles",
+        aliases=["restoreroles"],
+        help="Restore missing roles from the latest server snapshot.",
+    )
+    @is_staff()
+    async def restore_roles(self, ctx: commands.Context) -> None:
+        """Recreate roles that exist in the snapshot but are missing from the guild."""
+        if not self.bot.db.pool:
+            await ctx.send("❌ Database is not connected.")
+            return
+
+        snapshot = await self._get_latest_snapshot(ctx.guild.id)
+        if not snapshot:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="❌ No Snapshot Found",
+                    description=(
+                        f"No snapshot exists for this server. "
+                        f"Run `{ctx.prefix}snapshot-now` first."
+                    ),
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        # Compare snapshot roles against current guild roles
+        current_role_ids = {r.id for r in ctx.guild.roles}
+        saved_roles = snapshot.get("roles", [])
+        missing_roles = [r for r in saved_roles if r["id"] not in current_role_ids]
+
+        if not missing_roles:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="✅ All Roles Present",
+                    description="No missing roles detected — your server matches the snapshot.",
+                    color=discord.Color.green(),
+                )
+            )
+            return
+
+        # Confirmation message
+        role_list = "\n".join(f"• `{r['name']}` (color: #{r['color']:06X})" for r in missing_roles[:20])
+        confirm_embed = discord.Embed(
+            title="🔄 Restore Roles?",
+            description=(
+                f"Found **{len(missing_roles)}** missing role(s):\n\n"
+                f"{role_list}\n\n"
+                f"Recreating now... (positions may differ from original)"
+            ),
+            color=discord.Color.orange(),
+        )
+        confirm_embed.set_footer(
+            text=f"Snapshot from: {snapshot.get('_created_at', 'unknown')}"
+        )
+        status_msg = await ctx.send(embed=confirm_embed)
+
+        # Recreate missing roles (sorted by position, lowest first)
+        missing_roles.sort(key=lambda r: r["position"])
+        restored = []
+        failed = []
+
+        for role_data in missing_roles:
+            try:
+                new_role = await ctx.guild.create_role(
+                    name=role_data["name"],
+                    color=discord.Color(role_data["color"]),
+                    permissions=discord.Permissions(role_data["permissions"]),
+                    hoist=role_data.get("hoist", False),
+                    mentionable=role_data.get("mentionable", False),
+                    reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                )
+                restored.append(new_role.name)
+            except discord.Forbidden:
+                failed.append(role_data["name"])
+            except discord.HTTPException as e:
+                failed.append(f"{role_data['name']} ({e})")
+
+        # Result embed
+        result_embed = discord.Embed(
+            title="🔄 Role Restoration Complete",
+            color=discord.Color.green() if not failed else discord.Color.orange(),
+        )
+        if restored:
+            result_embed.add_field(
+                name=f"✅ Restored ({len(restored)})",
+                value="\n".join(f"• `{r}`" for r in restored[:25]),
+                inline=False,
+            )
+        if failed:
+            result_embed.add_field(
+                name=f"❌ Failed ({len(failed)})",
+                value="\n".join(f"• `{r}`" for r in failed[:25]),
+                inline=False,
+            )
+        result_embed.set_footer(
+            text=f"Triggered by {ctx.author}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await status_msg.edit(embed=result_embed)
+
+        # Audit log
+        if self.bot.db.pool:
+            await insert_audit_log(
+                pool=self.bot.db.pool,
+                guild_id=ctx.guild.id,
+                actor_id=ctx.author.id,
+                target_id=None,
+                action_type="RESTORE_ROLES",
+                details={
+                    "restored": restored,
+                    "failed": failed,
+                    "total_missing": len(missing_roles),
+                },
+                severity="WARN",
+            )
+
+        logger.info(
+            f"🔄 Role restore in {ctx.guild.name}: "
+            f"{len(restored)} restored, {len(failed)} failed"
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    #  !restore-channels — Recreate missing channels from snapshot
+    # ══════════════════════════════════════════════════════════════
+
+    @commands.command(
+        name="restore-channels",
+        aliases=["restorechannels"],
+        help="Restore missing channels from the latest server snapshot.",
+    )
+    @is_staff()
+    async def restore_channels(self, ctx: commands.Context) -> None:
+        """Recreate channels that exist in the snapshot but are missing from the guild."""
+        if not self.bot.db.pool:
+            await ctx.send("❌ Database is not connected.")
+            return
+
+        snapshot = await self._get_latest_snapshot(ctx.guild.id)
+        if not snapshot:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="❌ No Snapshot Found",
+                    description=(
+                        f"No snapshot exists for this server. "
+                        f"Run `{ctx.prefix}snapshot-now` first."
+                    ),
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        # Compare snapshot channels against current guild channels
+        current_channel_ids = {c.id for c in ctx.guild.channels}
+        saved_channels = snapshot.get("channels", [])
+        missing_channels = [c for c in saved_channels if c["id"] not in current_channel_ids]
+
+        if not missing_channels:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="✅ All Channels Present",
+                    description="No missing channels detected — your server matches the snapshot.",
+                    color=discord.Color.green(),
+                )
+            )
+            return
+
+        # Warning + confirmation
+        channel_list = "\n".join(
+            f"• `#{c['name']}` ({c['type']})"
+            for c in missing_channels[:20]
+        )
+        confirm_embed = discord.Embed(
+            title="🔄 Restore Channels?",
+            description=(
+                f"Found **{len(missing_channels)}** missing channel(s):\n\n"
+                f"{channel_list}\n\n"
+                f"⚠️ **Warning:** Restored channels will be empty — "
+                f"message history **cannot** be recovered.\n\n"
+                f"Recreating now..."
+            ),
+            color=discord.Color.orange(),
+        )
+        confirm_embed.set_footer(
+            text=f"Snapshot from: {snapshot.get('_created_at', 'unknown')}"
+        )
+        status_msg = await ctx.send(embed=confirm_embed)
+
+        # Build a map of current categories by name for matching
+        category_map: dict[str, discord.CategoryChannel] = {
+            c.name: c for c in ctx.guild.categories
+        }
+
+        # Recreate missing channels
+        restored = []
+        failed = []
+
+        for ch_data in missing_channels:
+            try:
+                # Find the parent category
+                category = None
+                if ch_data.get("category_name"):
+                    category = category_map.get(ch_data["category_name"])
+
+                # Rebuild permission overwrites
+                overwrites = {}
+                for ow in ch_data.get("overwrites", []):
+                    if ow["target_type"] == "role":
+                        target = ctx.guild.get_role(ow["target_id"])
+                    else:
+                        target = ctx.guild.get_member(ow["target_id"])
+
+                    if target:
+                        overwrites[target] = discord.PermissionOverwrite.from_pair(
+                            discord.Permissions(ow["allow"]),
+                            discord.Permissions(ow["deny"]),
+                        )
+
+                ch_type = ch_data["type"]
+
+                if ch_type == "text":
+                    new_ch = await ctx.guild.create_text_channel(
+                        name=ch_data["name"],
+                        category=category,
+                        topic=ch_data.get("topic"),
+                        nsfw=ch_data.get("nsfw", False),
+                        slowmode_delay=ch_data.get("slowmode_delay", 0),
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    restored.append(f"#{new_ch.name}")
+
+                elif ch_type == "voice":
+                    new_ch = await ctx.guild.create_voice_channel(
+                        name=ch_data["name"],
+                        category=category,
+                        bitrate=ch_data.get("bitrate", 64000),
+                        user_limit=ch_data.get("user_limit", 0),
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    restored.append(f"🔊 {new_ch.name}")
+
+                elif ch_type == "category":
+                    new_cat = await ctx.guild.create_category(
+                        name=ch_data["name"],
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    # Update the category map so child channels can find it
+                    category_map[new_cat.name] = new_cat
+                    restored.append(f"📁 {new_cat.name}")
+
+                elif ch_type == "stage_voice":
+                    new_ch = await ctx.guild.create_stage_channel(
+                        name=ch_data["name"],
+                        category=category,
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    restored.append(f"🎙️ {new_ch.name}")
+
+                elif ch_type == "forum":
+                    new_ch = await ctx.guild.create_forum(
+                        name=ch_data["name"],
+                        category=category,
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    restored.append(f"💬 {new_ch.name}")
+
+                else:
+                    # Unknown channel type — try as text
+                    new_ch = await ctx.guild.create_text_channel(
+                        name=ch_data["name"],
+                        category=category,
+                        overwrites=overwrites,
+                        reason=f"[AntiRaid] Restored from snapshot by {ctx.author}",
+                    )
+                    restored.append(f"#{new_ch.name}")
+
+            except discord.Forbidden:
+                failed.append(ch_data["name"])
+            except discord.HTTPException as e:
+                failed.append(f"{ch_data['name']} ({e})")
+
+        # Result embed
+        result_embed = discord.Embed(
+            title="🔄 Channel Restoration Complete",
+            color=discord.Color.green() if not failed else discord.Color.orange(),
+        )
+        if restored:
+            result_embed.add_field(
+                name=f"✅ Restored ({len(restored)})",
+                value="\n".join(f"• {c}" for c in restored[:25]),
+                inline=False,
+            )
+        if failed:
+            result_embed.add_field(
+                name=f"❌ Failed ({len(failed)})",
+                value="\n".join(f"• `{c}`" for c in failed[:25]),
+                inline=False,
+            )
+        result_embed.add_field(
+            name="⚠️ Important",
+            value="Message history from deleted channels **cannot** be recovered.",
+            inline=False,
+        )
+        result_embed.set_footer(
+            text=f"Triggered by {ctx.author}",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await status_msg.edit(embed=result_embed)
+
+        # Audit log
+        if self.bot.db.pool:
+            await insert_audit_log(
+                pool=self.bot.db.pool,
+                guild_id=ctx.guild.id,
+                actor_id=ctx.author.id,
+                target_id=None,
+                action_type="RESTORE_CHANNELS",
+                details={
+                    "restored": restored,
+                    "failed": failed,
+                    "total_missing": len(missing_channels),
+                },
+                severity="WARN",
+            )
+
+        logger.info(
+            f"🔄 Channel restore in {ctx.guild.name}: "
+            f"{len(restored)} restored, {len(failed)} failed"
+        )
+
+
+# ── Cog Setup (required for dynamic loading) ──────────────────
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(Recovery(bot))
