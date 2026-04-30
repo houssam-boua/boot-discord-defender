@@ -42,6 +42,20 @@ class AdminConfig(commands.Cog, name="⚙️ Configuration"):
             guild_id,
         )
 
+    # ── M-4 fix: Invalidate cog caches after config updates ───
+    def _invalidate_cog_caches(self, guild_id: int) -> None:
+        """
+        Notify AntiSpam and AntiNuke cogs to clear their in-memory
+        config caches so updated settings take effect immediately.
+        """
+        antispam = self.bot.get_cog("🛡️ Anti-Spam")
+        if antispam and hasattr(antispam, "invalidate_config_cache"):
+            antispam.invalidate_config_cache(guild_id)
+
+        antinuke = self.bot.get_cog("🛡️ Anti-Nuke")
+        if antinuke and hasattr(antinuke, "invalidate_cache"):
+            antinuke.invalidate_cache(guild_id)
+
     # ══════════════════════════════════════════════════════════════
     #  !set-prefix [new_prefix]
     # ══════════════════════════════════════════════════════════════
@@ -243,6 +257,9 @@ class AdminConfig(commands.Cog, name="⚙️ Configuration"):
             ctx.guild.id,
         )
 
+        # M-4 fix: invalidate cog caches so new thresholds take effect
+        self._invalidate_cog_caches(ctx.guild.id)
+
         # ── Confirmation ───────────────────────────────────────
         embed = discord.Embed(
             title="✅ Raid Limit Updated",
@@ -294,6 +311,7 @@ class AdminConfig(commands.Cog, name="⚙️ Configuration"):
         embed.set_footer(text=f"Changed by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
         logger.info(f"Quarantine role set to {role.name} in {ctx.guild.name} by {ctx.author}")
+        self._invalidate_cog_caches(ctx.guild.id)
 
     # ══════════════════════════════════════════════════════════════
     #  !set-account-age [hours]
@@ -331,6 +349,7 @@ class AdminConfig(commands.Cog, name="⚙️ Configuration"):
         embed.set_footer(text=f"Changed by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
         logger.info(f"Min account age set to {hours}h in {ctx.guild.name} by {ctx.author}")
+        self._invalidate_cog_caches(ctx.guild.id)
 
     # ══════════════════════════════════════════════════════════════
     #  !toggle [module] [on/off]
@@ -392,6 +411,7 @@ class AdminConfig(commands.Cog, name="⚙️ Configuration"):
         embed.set_footer(text=f"Changed by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
         logger.info(f"Toggle {module}={enabled} in {ctx.guild.name} by {ctx.author}")
+        self._invalidate_cog_caches(ctx.guild.id)
 
     # ══════════════════════════════════════════════════════════════
     #  !whitelist add/remove/list

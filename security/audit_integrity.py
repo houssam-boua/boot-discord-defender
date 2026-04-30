@@ -51,8 +51,12 @@ async def insert_audit_log(
     """
     Insert a tamper-proof audit log entry into the database.
 
-    Steps:
-      1. Fetch the last hash_signature for this guild.
+    Uses an explicit transaction with SELECT ... FOR UPDATE to prevent
+    concurrent events from reading the same previous_hash and silently
+    breaking the cryptographic chain (race condition fix C-1).
+
+    Steps (inside a single transaction):
+      1. Lock + fetch the last hash_signature for this guild.
       2. Compute the new hash from (previous_hash + log_data).
       3. INSERT the row with the computed hash_signature.
 
@@ -66,27 +70,41 @@ async def insert_audit_log(
         severity:    Log severity — "INFO", "WARN", or "CRITICAL".
     """
     try:
-        # Fetch the last hash
-        last = await pool.fetchrow(
-            "SELECT hash_signature FROM audit_logs WHERE guild_id=$1 ORDER BY id DESC LIMIT 1",
-            guild_id
-        )
-        previous_hash = last["hash_signature"] if last else "GENESIS"
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Lock the most recent row for this guild to serialize
+                # concurrent hash chain appends (prevents race condition)
+                last = await conn.fetchrow(
+                    """SELECT hash_signature FROM audit_logs
+                       WHERE guild_id = $1
+                       ORDER BY id DESC LIMIT 1
+                       FOR UPDATE""",
+                    guild_id,
+                )
+                previous_hash = last["hash_signature"] if last else "GENESIS"
 
-        log_data = {
-            "guild_id": guild_id, "actor_id": actor_id,
-            "target_id": target_id, "action_type": action_type,
-            "details": details
-        }
-        new_hash = compute_log_hash(previous_hash, log_data)
+                log_data = {
+                    "guild_id": guild_id,
+                    "actor_id": actor_id,
+                    "target_id": target_id,
+                    "action_type": action_type,
+                    "details": details,
+                }
+                new_hash = compute_log_hash(previous_hash, log_data)
 
-        await pool.execute(
-            """INSERT INTO audit_logs
-               (guild_id, actor_id, target_id, action_type, details, severity, hash_signature)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-            guild_id, actor_id, target_id, action_type,
-            json.dumps(details), severity, new_hash
-        )
+                await conn.execute(
+                    """INSERT INTO audit_logs
+                       (guild_id, actor_id, target_id, action_type,
+                        details, severity, hash_signature)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    guild_id,
+                    actor_id,
+                    target_id,
+                    action_type,
+                    json.dumps(details),
+                    severity,
+                    new_hash,
+                )
 
         logger.debug(
             f"📝 Audit log: {action_type} in guild {guild_id} "
@@ -95,3 +113,4 @@ async def insert_audit_log(
 
     except Exception as e:
         logger.error(f"❌ Failed to insert audit log: {e}")
+

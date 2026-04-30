@@ -36,6 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("antiraid")
 
+# L-3 fix: Security-critical cogs — if any fail to load,
+# the bot owner is notified via DM on startup.
+CRITICAL_COGS = {"cogs.antinuke", "cogs.antispam", "cogs.verification"}
+
 
 # ── Per-Guild Dynamic Prefix ──────────────────────────────────
 # Fetches the custom prefix from PostgreSQL (server_configs table).
@@ -87,6 +91,8 @@ class AntiRaidBot(commands.Bot):
         self.db = Database()
         self.redis: aioredis.Redis | None = None
         self.prefix_cache: dict[int, str] = {}
+        self._ready_fired: bool = False
+        self.failed_cogs: list[str] = []  # L-3 fix: tracked for owner alert
 
     async def setup_hook(self) -> None:
         """
@@ -137,6 +143,13 @@ class AntiRaidBot(commands.Bot):
         except Exception as e:
             logger.warning(f"⚠️ Punishment scheduler failed to start: {e}")
 
+        # ── 4b. Recover punishments from previous session ──────
+        try:
+            from services.punishment_scheduler import recover_punishments_on_boot
+            await recover_punishments_on_boot(self)
+        except Exception as e:
+            logger.warning(f"⚠️ Punishment recovery failed: {e}")
+
         # ── 5. Load all Cogs dynamically ───────────────────────
         await self._load_cogs()
 
@@ -148,6 +161,7 @@ class AntiRaidBot(commands.Bot):
         Skips __init__.py and files that don't define a proper Cog yet.
         """
         cogs_dir = Path(__file__).parent / "cogs"
+        self.failed_cogs = []  # L-3 fix: reset on each load
 
         for cog_file in sorted(cogs_dir.glob("*.py")):
             if cog_file.name.startswith("__"):
@@ -162,9 +176,22 @@ class AntiRaidBot(commands.Bot):
                 logger.debug(f"  ⏭️  Skipped {cog_module} (no setup function)")
             except Exception as e:
                 logger.error(f"  ❌ Failed to load {cog_module}: {e}")
+                # L-3 fix: track critical cog failures for owner alert
+                if cog_module in CRITICAL_COGS:
+                    self.failed_cogs.append(cog_module)
 
     async def on_ready(self) -> None:
-        """Fired when the bot successfully connects to Discord."""
+        """Fired when the bot connects/reconnects to Discord."""
+        # ── Guard: on_ready fires on EVERY gateway reconnect ──
+        if self._ready_fired:
+            logger.info(
+                f"🔄 Gateway reconnected — {self.user} "
+                f"(Guilds: {len(self.guilds)}, Latency: {round(self.latency * 1000)}ms)"
+            )
+            return
+
+        self._ready_fired = True
+
         logger.info(
             f"\n{'═' * 50}\n"
             f"  🛡️  AntiRaid Bot is ONLINE\n"
@@ -186,6 +213,32 @@ class AntiRaidBot(commands.Bot):
             activity=activity,
         )
 
+        # L-3 fix: DM the bot owner if critical security cogs failed to load
+        if self.failed_cogs:
+            logger.critical(
+                f"🚨 CRITICAL COGS FAILED TO LOAD: {', '.join(self.failed_cogs)}"
+            )
+            try:
+                app_info = await self.application_info()
+                owner = app_info.owner
+                if owner:
+                    failed_list = "\n".join(f"• `{c}`" for c in self.failed_cogs)
+                    embed = discord.Embed(
+                        title="🚨 CRITICAL — Security Cogs Failed to Load",
+                        description=(
+                            f"The following **security-critical** cogs failed to load "
+                            f"on startup. Your server(s) may be **unprotected**.\n\n"
+                            f"{failed_list}\n\n"
+                            f"Check the Railway/console logs for the full error traceback."
+                        ),
+                        color=discord.Color.dark_red(),
+                    )
+                    embed.set_footer(text="AntiRaid Security Bot — Automated Alert")
+                    await owner.send(embed=embed)
+                    logger.info("📩 Critical cog failure alert sent to bot owner.")
+            except Exception as e:
+                logger.warning(f"Could not DM owner about failed cogs: {e}")
+
     async def close(self) -> None:
         """Graceful shutdown — close all external connections."""
         logger.info("🔌 Shutting down — closing connections...")
@@ -194,6 +247,13 @@ class AntiRaidBot(commands.Bot):
         try:
             from services.punishment_scheduler import stop_scheduler
             stop_scheduler()
+        except Exception:
+            pass
+
+        # H-3 fix: close the singleton aiohttp session
+        try:
+            from services.linkscanner import close_session
+            await close_session()
         except Exception:
             pass
 

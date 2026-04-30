@@ -14,6 +14,8 @@ import discord
 from discord.ext import commands
 
 import logging
+import time
+from collections import deque, defaultdict
 from datetime import timedelta
 
 from utils.threat_data import ZALGO_RE
@@ -38,6 +40,8 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         self.bot = bot
         # Per-guild config cache: {guild_id: {config_dict}}
         self._config_cache: dict[int, dict] = {}
+        # H-4 fix: local sliding window fallback when Redis is unavailable
+        self._local_spam_cache: dict[str, deque] = defaultdict(deque)
 
     # ══════════════════════════════════════════════════════════════
     #  Config Loader — fetches per-guild settings from DB
@@ -346,32 +350,62 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                 limit=config["spam_msg_limit"],
                 window=config["spam_msg_seconds"],
             )
+        else:
+            # H-4 fix: local fallback when Redis is unavailable
+            is_flooding = self._check_flood_fallback(
+                user_id=member.id,
+                guild_id=message.guild.id,
+                limit=config["spam_msg_limit"],
+                window=config["spam_msg_seconds"],
+            )
 
-            if is_flooding:
-                muted = await self._auto_mute(
-                    member,
-                    reason=(
-                        f"Message flood ({config['spam_msg_limit']}+ msgs "
-                        f"in {config['spam_msg_seconds']}s)"
-                    ),
-                )
+        if is_flooding:
+            muted = await self._auto_mute(
+                member,
+                reason=(
+                    f"Message flood ({config['spam_msg_limit']}+ msgs "
+                    f"in {config['spam_msg_seconds']}s)"
+                ),
+            )
 
-                logger.warning(
-                    f"🌊 Flood detected from {member} ({member.id}) in "
-                    f"{message.guild.name} — auto-muted"
-                )
+            logger.warning(
+                f"🌊 Flood detected from {member} ({member.id}) in "
+                f"{message.guild.name} — auto-muted"
+            )
 
-                await self._send_alert(
-                    guild=message.guild,
-                    title="🌊 Message Flood Detected",
-                    description=(
-                        f"{member.mention} exceeded the message velocity limit.\n"
-                        f"**Threshold:** {config['spam_msg_limit']} messages "
-                        f"in {config['spam_msg_seconds']}s\n\n"
-                        f"**Action:** {'**User muted**' if muted else 'Mute failed (missing permissions)'}"
-                    ),
-                    member=member,
-                )
+            await self._send_alert(
+                guild=message.guild,
+                title="🌊 Message Flood Detected",
+                description=(
+                    f"{member.mention} exceeded the message velocity limit.\n"
+                    f"**Threshold:** {config['spam_msg_limit']} messages "
+                    f"in {config['spam_msg_seconds']}s\n\n"
+                    f"**Action:** {'**User muted**' if muted else 'Mute failed (missing permissions)'}"
+                ),
+                member=member,
+            )
+
+    # ══════════════════════════════════════════════════════════════
+    #  H-4 Fix: Local sliding window fallback (no Redis)
+    # ══════════════════════════════════════════════════════════════
+
+    def _check_flood_fallback(
+        self, user_id: int, guild_id: int, limit: int, window: int
+    ) -> bool:
+        """
+        In-memory sliding window using deque when Redis is unavailable.
+        Not distributed, but prevents complete loss of flood protection.
+        """
+        key = f"{guild_id}:{user_id}"
+        now = time.time()
+        timestamps = self._local_spam_cache[key]
+
+        # Prune old entries outside the window
+        while timestamps and timestamps[0] < now - window:
+            timestamps.popleft()
+
+        timestamps.append(now)
+        return len(timestamps) > limit
 
 
 # ── Cog Setup (required for dynamic loading) ──────────────────

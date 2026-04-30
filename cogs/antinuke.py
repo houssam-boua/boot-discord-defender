@@ -43,13 +43,19 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # H-1 fix: cache antinuke_enabled per guild to avoid DB hit on every event
+        self._enabled_cache: dict[int, bool] = {}
 
     # ══════════════════════════════════════════════════════════════
     #  Helper: Check if antinuke is enabled for this guild
     # ══════════════════════════════════════════════════════════════
 
     async def _is_enabled(self, guild_id: int) -> bool:
-        """Check antinuke_enabled flag from server_configs."""
+        """Check antinuke_enabled flag from server_configs (cached)."""
+        # H-1 fix: check in-memory cache first
+        if guild_id in self._enabled_cache:
+            return self._enabled_cache[guild_id]
+
         if not self.bot.db.pool:
             return False
 
@@ -58,7 +64,13 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
             guild_id,
         )
         # Default to True if no config row exists
-        return row["antinuke_enabled"] if row else True
+        result = row["antinuke_enabled"] if row else True
+        self._enabled_cache[guild_id] = result
+        return result
+
+    def invalidate_cache(self, guild_id: int) -> None:
+        """Clear the cached enabled flag so the next check re-queries DB."""
+        self._enabled_cache.pop(guild_id, None)
 
     # ══════════════════════════════════════════════════════════════
     #  Helper: Get log channel
@@ -81,18 +93,31 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
         return guild.get_channel(row["log_channel_id"])
 
     # ══════════════════════════════════════════════════════════════
-    #  Helper: Bypass check — skip if actor is bot or guild owner
+    #  Helper: Bypass check — skip if actor is bot, owner, or whitelisted
     # ══════════════════════════════════════════════════════════════
 
-    def _should_bypass(self, guild: discord.Guild, actor: discord.User) -> bool:
+    async def _should_bypass(self, guild: discord.Guild, actor: discord.User) -> bool:
         """
         Returns True if the actor should be exempt from antinuke checks.
-        Bypass rule: bot itself + guild owner are always allowed.
+        Bypass rule: bot itself + guild owner + antinuke_whitelist entries.
         """
         if actor.id == self.bot.user.id:
             return True
         if actor.id == guild.owner_id:
             return True
+
+        # H-2 fix: check antinuke_whitelist table
+        if self.bot.db.pool:
+            row = await self.bot.db.pool.fetchrow(
+                """SELECT 1 FROM antinuke_whitelist
+                   WHERE guild_id = $1 AND user_id = $2
+                   LIMIT 1""",
+                guild.id,
+                actor.id,
+            )
+            if row:
+                return True
+
         return False
 
     # ══════════════════════════════════════════════════════════════
@@ -127,7 +152,14 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
         if count == 1:
             await self.bot.redis.expire(key, NUKE_WINDOW_SECONDS)
 
-        return count >= NUKE_THRESHOLD
+        if count >= NUKE_THRESHOLD:
+            # C-3 fix: Redis NX lock prevents parallel events from ALL
+            # triggering _mitigate_nuke simultaneously (rate limit protection)
+            lock_key = f"nuke:mitigate:lock:{guild.id}:{actor.id}"
+            acquired = await self.bot.redis.set(lock_key, "1", nx=True, ex=30)
+            return bool(acquired)
+
+        return False
 
     # ══════════════════════════════════════════════════════════════
     #  Core: Mitigation Response — strip all roles from rogue actor
@@ -269,7 +301,7 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
 
         if not actor:
             return
-        if self._should_bypass(guild, actor):
+        if await self._should_bypass(guild, actor):
             return
 
         # Track in Redis and check threshold
@@ -299,7 +331,9 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
             return
 
         # Small delay to allow the audit log entry to appear
-        await asyncio.sleep(0.5)
+        # L-1 fix: increased from 0.5s to 1.5s — Discord API often
+        # takes ~1s to populate kick audit entries
+        await asyncio.sleep(1.5)
 
         # Check audit log for a recent kick action targeting this member
         actor = None
@@ -321,7 +355,7 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
         # No kick found — member left voluntarily
         if not actor:
             return
-        if self._should_bypass(guild, actor):
+        if await self._should_bypass(guild, actor):
             return
 
         # Track in Redis and check threshold
@@ -364,7 +398,7 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
 
         if not actor:
             return
-        if self._should_bypass(guild, actor):
+        if await self._should_bypass(guild, actor):
             return
 
         # Track in Redis and check threshold
@@ -405,7 +439,7 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
 
         if not actor:
             return
-        if self._should_bypass(guild, actor):
+        if await self._should_bypass(guild, actor):
             return
 
         # Track in Redis and check threshold

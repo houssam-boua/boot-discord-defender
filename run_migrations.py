@@ -216,6 +216,8 @@ async def run_migrations() -> None:
         "audit_logs",
         "risk_scores",
         "server_snapshots",
+        "antinuke_whitelist",
+        "captcha_challenges",
     }
 
     existing_tables = {row["tablename"] for row in rows}

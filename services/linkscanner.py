@@ -10,12 +10,40 @@
 import re
 import logging
 
+import aiohttp
+
 from utils.threat_data import PHISHING_DOMAINS, URL_RE
 
 logger = logging.getLogger("antiraid.linkscanner")
 
 # In-memory cache — loaded from DB on startup, updated on !link-add
 _domain_cache: set[str] = set(PHISHING_DOMAINS)
+
+# H-3 fix: Singleton aiohttp session to prevent resource leaks.
+# All HTTP calls (e.g., future VirusTotal Layer 2) reuse this session.
+_session: aiohttp.ClientSession | None = None
+
+
+def get_session() -> aiohttp.ClientSession:
+    """
+    Get or create the singleton aiohttp session.
+    Reuses a single TCP connection pool for all outbound HTTP calls.
+    """
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+    return _session
+
+
+async def close_session() -> None:
+    """Close the singleton session cleanly on bot shutdown."""
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+        _session = None
+        logger.info("  ✅ aiohttp session closed.")
 
 
 async def load_cache_from_db(pool) -> None:
