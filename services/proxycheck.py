@@ -14,6 +14,25 @@ import aiohttp
 logger = logging.getLogger("antiraid.proxycheck")
 
 
+_session: aiohttp.ClientSession | None = None
+
+def get_session() -> aiohttp.ClientSession:
+    """Get or create the singleton aiohttp session."""
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5),
+        )
+    return _session
+
+
+async def close_session() -> None:
+    """Close the aiohttp session. Called during bot shutdown."""
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+
+
 async def check_ip(ip: str, api_key: str) -> dict:
     """
     Query the Proxycheck.io API for an IP's reputation.
@@ -28,21 +47,19 @@ async def check_ip(ip: str, api_key: str) -> dict:
     """
     url = f"https://proxycheck.io/v2/{ip}?key={api_key}&vpn=1&risk=1"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                data = await resp.json()
-                result = data.get(ip, {})
+        session = get_session()
+        async with session.get(url) as resp:
+            data = await resp.json()
+            result = data.get(ip, {})
 
-                logger.debug(
-                    f"ProxyCheck result for {ip}: "
-                    f"proxy={result.get('proxy')}, "
-                    f"type={result.get('type')}, "
-                    f"risk={result.get('risk')}"
-                )
+            logger.debug(
+                f"ProxyCheck result for {ip}: "
+                f"proxy={result.get('proxy')}, "
+                f"type={result.get('type')}, "
+                f"risk={result.get('risk')}"
+            )
 
-                return result
+            return result
 
     except aiohttp.ClientError as e:
         logger.warning(f"ProxyCheck API request failed for {ip}: {e}")

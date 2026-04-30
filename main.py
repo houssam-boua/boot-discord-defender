@@ -254,8 +254,10 @@ class AntiRaidBot(commands.Bot):
 
         # H-3 fix: close the singleton aiohttp session
         try:
-            from services.linkscanner import close_session
-            await close_session()
+            from services.linkscanner import close_session as link_close
+            from services.proxycheck import close_session as proxy_close
+            await link_close()
+            await proxy_close()
         except Exception:
             pass
 

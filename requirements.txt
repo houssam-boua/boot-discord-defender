@@ -24,5 +24,3 @@ python-dotenv>=1.0.0
 # Image Processing (CAPTCHA generation)
 Pillow>=10.0.0
 
-# Supabase Client (optional, for direct Supabase SDK usage)
-supabase>=2.0.0
