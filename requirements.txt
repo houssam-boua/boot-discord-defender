@@ -1,0 +1,28 @@
+# ══════════════════════════════════════════════════════════════════
+#  AntiRaid Security Bot — Dependencies
+#  Stack: discord.py · asyncpg · Redis · APScheduler
+# ══════════════════════════════════════════════════════════════════
+
+# Bot Framework
+discord.py>=2.3.0
+
+# Database (Async PostgreSQL driver for Supabase)
+asyncpg>=0.29.0
+
+# Cache & Rate Limiting
+redis[asyncio]>=5.0.0
+
+# Task Scheduling (Temp bans/mutes auto-lift)
+APScheduler>=3.10.0
+
+# HTTP Client (VirusTotal, Proxycheck API calls)
+aiohttp>=3.9.0
+
+# Environment Variable Management
+python-dotenv>=1.0.0
+
+# Image Processing (CAPTCHA generation)
+Pillow>=10.0.0
+
+# Supabase Client (optional, for direct Supabase SDK usage)
+supabase>=2.0.0
