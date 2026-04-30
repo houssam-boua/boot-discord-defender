@@ -12,6 +12,7 @@
 
 import discord
 from discord.ext import commands
+import asyncio
 import re
 import logging
 import time
@@ -33,6 +34,61 @@ logger = logging.getLogger("antiraid.antispam")
 DEFAULT_MAX_MENTIONS = 5
 DEFAULT_SPAM_MSG_LIMIT = 5
 DEFAULT_SPAM_MSG_SECONDS = 2
+
+# Trusted domains — skipped by VirusTotal to save quota and time.
+# Subdomains are matched automatically by _is_safe_domain().
+_SAFE_DOMAINS: frozenset[str] = frozenset({
+    "youtube.com", "youtu.be",
+    "github.com", "githubusercontent.com",
+    "wikipedia.org",
+    "twitter.com", "x.com",
+    "twitch.tv",
+    "reddit.com", "redd.it",
+    "discord.com", "discordapp.com",
+    "google.com", "googleapis.com",
+    "instagram.com",
+    "linkedin.com",
+    "stackoverflow.com",
+    "imgur.com",
+    "tenor.com", "giphy.com",
+})
+
+def _is_safe_domain(url: str) -> bool:
+    """
+    Return True if the URL belongs to a known-safe domain.
+    Handles subdomains: en.wikipedia.org → wikipedia.org → True.
+    Returns False on any parse error (fail closed for safety).
+    """
+    try:
+        from urllib.parse import urlparse
+        hostname = urlparse(url).hostname or ""
+        hostname = hostname.removeprefix("www.")
+        parts = hostname.split(".")
+        for i in range(len(parts) - 1):
+            if ".".join(parts[i:]) in _SAFE_DOMAINS:
+                return True
+        return False
+    except Exception:
+        return False
+
+async def _safe_delete(
+    message: discord.Message, *, reason: str = ""
+) -> None:
+    """Delete a message and log the outcome clearly."""
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass  # Already deleted — fine
+    except discord.Forbidden:
+        logger.warning(
+            f"⚠️ Cannot delete msg {message.id} in "
+            f"#{message.channel.name} — bot missing MANAGE_MESSAGES. "
+            f"Reason: {reason}"
+        )
+    except Exception as e:
+        logger.error(
+            f"❌ Unexpected error deleting msg {message.id}: {e}"
+        )
 
 
 class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
@@ -235,10 +291,10 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         if not isinstance(member, discord.Member):
             return
 
-        # Skip server owner and administrators
+        # Skip server owner and the bot itself
         if member.id == message.guild.owner_id:
             return
-        if member.guild_permissions.administrator:
+        if member.id == self.bot.user.id:
             return
 
         # ── Load guild config ──────────────────────────────────
@@ -255,10 +311,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         #  CHECK 1: Zalgo Text Detection
         # ══════════════════════════════════════════════════════════
         if ZALGO_RE.search(message.content):
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
+            await _safe_delete(message, reason="Zalgo text")
 
             logger.info(
                 f"🧹 Zalgo text deleted from {member} ({member.id}) "
@@ -289,16 +342,26 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             from services.linkscanner import extract_urls, check_virustotal
 
             all_urls = extract_urls(message.content)
-            for url in all_urls[:3]:  # Cap at 3 URLs per message to avoid API abuse
-                vt_score = await check_virustotal(url)
-                if vt_score > 0:
-                    flagged_urls.append(url)
+            # Only scan URLs that are not on the trusted safelist
+            unknown_urls = [u for u in all_urls if not _is_safe_domain(u)]
+
+            for url in unknown_urls[:3]:
+                try:
+                    vt_score = await check_virustotal(url)
+                    if vt_score > 0:
+                        flagged_urls.append(url)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"⏱️ VT timeout scanning {url} from "
+                        f"{member} ({member.id}) — leaving message"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ VT scan error for {url}: {e} — leaving message"
+                    )
 
         if flagged_urls:
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
+            await _safe_delete(message, reason="Malicious link")
 
             # Determine source for the alert
             source = "VirusTotal Layer 2" if not scan_message_urls(message.content) else "Domain Cache"
@@ -332,10 +395,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         # ══════════════════════════════════════════════════════════
         if INVITE_RE.search(message.content):
             if not config.get("allow_invites", False):
-                try:
-                    await message.delete()
-                except discord.Forbidden:
-                    pass
+                await _safe_delete(message, reason="Discord invite link")
                 logger.info(
                     f"Invite link blocked from {member} ({member.id}) "
                     f"in #{message.channel.name}"
@@ -365,10 +425,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         max_mentions = config["max_mentions"]
 
         if total_mentions > max_mentions:
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
+            await _safe_delete(message, reason="Mass mentions")
 
             muted = await self._auto_mute(
                 member,
@@ -414,6 +471,9 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             )
 
         if is_flooding:
+            # Delete the message that triggered the flood threshold
+            await _safe_delete(message, reason="Message flood")
+
             muted = await self._auto_mute(
                 member,
                 reason=(
