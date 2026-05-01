@@ -559,7 +559,7 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
         target_channel = None
         for ch in guild.text_channels:
-            if guild.me.permissions_in(ch).send_messages:
+            if ch.permissions_for(guild.me).send_messages:
                 target_channel = ch
                 break
 
