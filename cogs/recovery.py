@@ -36,6 +36,7 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._snapshot_tasks: dict[int, asyncio.Task] = {}
 
     async def cog_load(self) -> None:
         """Start the background snapshot loop when the cog loads."""
@@ -44,6 +45,12 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
     async def cog_unload(self) -> None:
         """Stop the loop when the cog unloads."""
+        # Cancel all pending debounced snapshot tasks on cog unload
+        # Prevents orphaned tasks, memory leaks, and post-shutdown fires
+        for task in self._snapshot_tasks.values():
+            if not task.done():
+                task.cancel()
+
         self.snapshot_loop.cancel()
 
     # ══════════════════════════════════════════════════════════════
@@ -837,6 +844,71 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
             f"🔄 Channel restore in {ctx.guild.name}: "
             f"{len(restored)} restored, {len(failed)} failed"
         )
+
+    # ══════════════════════════════════════════════════════════════
+    #  Live Snapshot Engine — Debounced to prevent DB/API exhaustion
+    # ══════════════════════════════════════════════════════════════
+
+    async def _debounced_snapshot(
+        self, guild: discord.Guild, delay: float = 5.0
+    ):
+        """
+        Waits `delay` seconds then fires exactly one snapshot.
+        If a newer event cancels this task before the delay
+        expires, returns silently — no log noise, no crash.
+
+        Safety properties:
+          - asyncio.sleep() is INSIDE the try block so cancellation
+            during the wait is always caught by CancelledError
+          - CancelledError is caught BEFORE Exception (order matters)
+          - finally always cleans up the task dict entry
+        """
+        try:
+            await asyncio.sleep(delay)
+            await self._take_snapshot(guild)
+        except asyncio.CancelledError:
+            return  # expected — a newer event reset the timer, silent exit
+        except Exception as e:
+            logging.getLogger("antiraid.recovery").warning(
+                f"⚠️ Debounced snapshot failed for {guild.name}: {e}"
+            )
+        finally:
+            self._snapshot_tasks.pop(guild.id, None)
+
+    def _schedule_snapshot(self, guild: discord.Guild):
+        """
+        Cancels any pending snapshot task for this guild and
+        schedules a fresh one. Always called as a plain method —
+        NEVER awaited. Each guild gets its own slot so two guilds
+        never cancel each other's timers.
+        """
+        existing = self._snapshot_tasks.get(guild.id)
+        if existing and not existing.done():
+            existing.cancel()
+        self._snapshot_tasks[guild.id] = asyncio.create_task(
+            self._debounced_snapshot(guild)
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(
+        self, channel: discord.abc.GuildChannel
+    ):
+        """Re-snapshot on channel create so new channels are never lost."""
+        self._schedule_snapshot(channel.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role):
+        """Re-snapshot on role create so new roles are never lost."""
+        self._schedule_snapshot(role.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(
+        self,
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ):
+        """Re-snapshot on channel edits (name, topic, permissions changed)."""
+        self._schedule_snapshot(after.guild)
 
 
 # ── Cog Setup (required for dynamic loading) ──────────────────
