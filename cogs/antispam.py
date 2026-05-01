@@ -190,6 +190,52 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             logger.error(f"❌ Failed to mute {member}: {e}")
             return False
 
+    async def _strip_admin_roles(
+        self,
+        member: discord.Member,
+        reason: str,
+    ) -> list[discord.Role]:
+        """
+        Strip all roles that grant administrator permission from a member.
+        Used when timeout fails because the member has admin privileges.
+
+        Returns list of stripped roles (for logging and DB record).
+        Skips managed roles (bot roles) — Discord forbids removing them.
+        """
+        admin_roles = [
+            r for r in member.roles
+            if r.permissions.administrator
+            and not r.managed          # never try to remove bot-managed roles
+            and not r.is_default()     # never try to remove @everyone
+        ]
+
+        if not admin_roles:
+            return []
+
+        try:
+            await member.remove_roles(
+                *admin_roles,
+                reason=f"[AntiRaid] {reason} — stripping admin roles to allow mute",
+                atomic=False,
+            )
+            logger.warning(
+                f"🛡️ Stripped {len(admin_roles)} admin role(s) from "
+                f"{member} ({member.id}): "
+                f"{[r.name for r in admin_roles]}"
+            )
+            return admin_roles
+        except discord.Forbidden:
+            logger.error(
+                f"❌ Cannot strip admin roles from {member} ({member.id}) "
+                f"— bot role is too low in hierarchy"
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to strip admin roles from {member}: {e}"
+            )
+            return []
+
     # ══════════════════════════════════════════════════════════════
     #  Alert Helper — sends incident notification to log channel
     # ══════════════════════════════════════════════════════════════
@@ -363,18 +409,73 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
         if flagged_urls:
             await _safe_delete(message, reason="Malicious link")
 
-            # Determine source for the alert
-            source = "VirusTotal Layer 2" if not scan_message_urls(message.content) else "Domain Cache"
-
-            muted = await self._auto_mute(
-                member, reason=f"Phishing link detected: {flagged_urls[0]}"
+            # Determine detection source for the alert
+            source = (
+                "VirusTotal Layer 2"
+                if not scan_message_urls(message.content)
+                else "Domain Cache"
             )
+
+            mute_reason = f"Phishing link detected: {flagged_urls[0]}"
+
+            # ── Attempt 1: standard timeout ────────────────────────
+            muted = await self._auto_mute(member, reason=mute_reason)
+            stripped_roles: list[discord.Role] = []
+
+            # ── Attempt 2: admin bypass — strip roles then re-mute ─
+            if not muted:
+                stripped_roles = await self._strip_admin_roles(
+                    member,
+                    reason=mute_reason,
+                )
+                if stripped_roles:
+                    # Re-attempt timeout now that admin roles are gone
+                    muted = await self._auto_mute(member, reason=mute_reason)
+
+            # ── Build action summary ───────────────────────────────
+            action_parts = ["Message deleted"]
+            if muted:
+                action_parts.append("**User muted (10 min)**")
+            if stripped_roles:
+                names = ", ".join(f"`{r.name}`" for r in stripped_roles)
+                action_parts.append(f"**Admin roles stripped:** {names}")
+            if not muted and not stripped_roles:
+                action_parts.append(
+                    "⚠️ Mute failed — bot role may be too low in hierarchy"
+                )
+
+            action_text = " + ".join(action_parts)
+
+            # ── Save stripped roles to DB for audit/restore ────────
+            if stripped_roles:
+                try:
+                    import json as _json
+                    await self.bot.db.pool.execute(
+                        """
+                        INSERT INTO admin_role_strips
+                            (guild_id, user_id, stripped_role_ids,
+                             stripped_role_names, reason, stripped_at)
+                        VALUES ($1, $2, $3, $4, $5, NOW())
+                        ON CONFLICT DO NOTHING
+                        """,
+                        message.guild.id,
+                        member.id,
+                        [r.id for r in stripped_roles],
+                        [r.name for r in stripped_roles],
+                        mute_reason,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Failed to save admin role strip to DB: {e} "
+                        f"— mute still applied"
+                    )
 
             logger.warning(
-                f"🔗 Malicious link from {member} ({member.id}): {flagged_urls} [via {source}]"
+                f"🔗 Malicious link from {member} ({member.id}): "
+                f"{flagged_urls} [via {source}] — "
+                f"muted={muted}, stripped={[r.name for r in stripped_roles]}"
             )
 
-            action_text = "Message deleted + **User muted**" if muted else "Message deleted"
             await self._send_alert(
                 guild=message.guild,
                 title="🔗 Phishing Link Detected",
