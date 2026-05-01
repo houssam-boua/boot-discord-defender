@@ -414,6 +414,20 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
                 },
             )
 
+            # ── AUTO-RESTORE: fires immediately after ban ───────────
+            recovery_cog = self.bot.get_cog("🔄 Recovery")
+            if recovery_cog:
+                asyncio.create_task(
+                    recovery_cog.restore_from_snapshot(
+                        guild,
+                        triggered_by=f"antinuke:channel_delete:{actor.id}",
+                    )
+                )
+            else:
+                logger.warning(
+                    "⚠️ Auto-restore skipped — Recovery cog not loaded"
+                )
+
     # ══════════════════════════════════════════════════════════════
     #  LISTENER: on_guild_role_delete — Anti-Role Nuke
     # ══════════════════════════════════════════════════════════════
@@ -455,6 +469,20 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
                     "role_position": role.position,
                 },
             )
+
+            # ── AUTO-RESTORE: fires immediately after ban ───────────
+            recovery_cog = self.bot.get_cog("🔄 Recovery")
+            if recovery_cog:
+                asyncio.create_task(
+                    recovery_cog.restore_from_snapshot(
+                        guild,
+                        triggered_by=f"antinuke:role_delete:{actor.id}",
+                    )
+                )
+            else:
+                logger.warning(
+                    "⚠️ Auto-restore skipped — Recovery cog not loaded"
+                )
 
     # ══════════════════════════════════════════════════════════════
     #  LISTENER: on_member_join — Anti-Bot Add

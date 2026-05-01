@@ -239,6 +239,236 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
             logger.error(f"Manual snapshot failed for {ctx.guild.name}: {e}")
 
     # ══════════════════════════════════════════════════════════════
+    #  Auto-Restore: Programmatic recovery without human input
+    # ══════════════════════════════════════════════════════════════
+
+    async def restore_from_snapshot(
+        self,
+        guild: discord.Guild,
+        *,
+        triggered_by: str = "auto-nuke-detection",
+    ) -> dict:
+        """
+        Programmatic restore triggered by anti-nuke detection.
+        Restores roles and channels from the most recent snapshot
+        without requiring a ctx object or any text channel.
+
+        Returns dict with keys:
+          roles_restored, channels_restored,
+          roles_failed, channels_failed,
+          snapshot_age_seconds
+        """
+        log = logging.getLogger("antiraid.recovery")
+        result = {
+            "roles_restored": 0,
+            "channels_restored": 0,
+            "roles_failed": 0,
+            "channels_failed": 0,
+            "snapshot_age_seconds": 0.0,
+        }
+
+        # ── Rate-guard: prevent duplicate restores within 60s ──
+        if self.bot.redis:
+            guard_key = f"antiraid:autorestore:{guild.id}"
+            already_running = await self.bot.redis.set(
+                guard_key, "1", nx=True, ex=60
+            )
+            if not already_running:
+                log.warning(
+                    f"⚠️ Auto-restore for {guild.name} already in "
+                    f"progress — skipping duplicate (rate-guard 60s)"
+                )
+                return result
+
+        if not self.bot.db.pool:
+            log.error(
+                "restore_from_snapshot: DB pool unavailable — cannot restore"
+            )
+            return result
+
+        # ── Load most recent snapshot ──────────────────────────
+        row = await self.bot.db.pool.fetchrow(
+            """SELECT data, created_at
+               FROM server_snapshots
+               WHERE guild_id = $1
+               ORDER BY created_at DESC
+               LIMIT 1""",
+            guild.id,
+        )
+
+        if not row:
+            log.error(
+                f"restore_from_snapshot: No snapshot found for "
+                f"{guild.name} ({guild.id}) — cannot restore"
+            )
+            return result
+
+        import json
+        from datetime import timezone
+        snapshot_age = (
+            discord.utils.utcnow()
+            - row["created_at"].replace(tzinfo=timezone.utc)
+        ).total_seconds()
+        result["snapshot_age_seconds"] = snapshot_age
+
+        data = row["data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+            
+        roles_data    = data.get("roles", [])
+        channels_data = data.get("channels", [])
+
+        log.warning(
+            f"🔄 AUTO-RESTORE triggered in {guild.name} ({guild.id}) "
+            f"by [{triggered_by}] — snapshot age: {snapshot_age:.0f}s "
+            f"| {len(roles_data)} roles, {len(channels_data)} channels"
+        )
+
+        # ── Pre-restore forensic snapshot ──────────────────────
+        # Saves the current (damaged) state for forensic analysis.
+        try:
+            await self._take_snapshot(guild)
+            log.info(f"📸 Pre-restore forensic snapshot saved for {guild.name}")
+        except Exception as e:
+            log.warning(
+                f"⚠️ Pre-restore snapshot failed: {e} — continuing restore"
+            )
+
+        # ── Step 1: Restore Roles ──────────────────────────────
+        existing_role_names = {r.name for r in guild.roles}
+
+        for role_info in roles_data:
+            role_name = role_info.get("name", "")
+            if not role_name or role_name == "@everyone":
+                continue
+            if role_name in existing_role_names:
+                continue  # Role still exists — skip
+
+            try:
+                permissions = discord.Permissions(
+                    role_info.get("permissions", 0)
+                )
+                color_value = role_info.get("color", 0)
+                color = (
+                    discord.Color(color_value)
+                    if color_value
+                    else discord.Color.default()
+                )
+                await guild.create_role(
+                    name=role_name,
+                    permissions=permissions,
+                    color=color,
+                    hoist=role_info.get("hoist", False),
+                    mentionable=role_info.get("mentionable", False),
+                    reason=(
+                        f"[AntiRaid] Auto-restore — "
+                        f"triggered by {triggered_by}"
+                    ),
+                )
+                result["roles_restored"] += 1
+                log.info(f"  ✅ Role restored: {role_name}")
+
+            except discord.Forbidden:
+                result["roles_failed"] += 1
+                log.warning(
+                    f"  ⚠️ Cannot restore role {role_name} — missing permissions"
+                )
+            except Exception as e:
+                result["roles_failed"] += 1
+                log.error(f"  ❌ Failed to restore role {role_name}: {e}")
+
+        # ── Step 2: Restore Channels ───────────────────────────
+        existing_channel_names = {c.name for c in guild.channels}
+
+        for ch_info in channels_data:
+            ch_name = ch_info.get("name", "")
+            if not ch_name:
+                continue
+            if ch_name in existing_channel_names:
+                continue  # Channel still exists — skip
+
+            try:
+                ch_type = ch_info.get("type", "text")
+
+                if ch_type == "text":
+                    await guild.create_text_channel(
+                        name=ch_name,
+                        topic=ch_info.get("topic", ""),
+                        slowmode_delay=ch_info.get("slowmode_delay", 0),
+                        nsfw=ch_info.get("nsfw", False),
+                        reason=(
+                            f"[AntiRaid] Auto-restore — "
+                            f"triggered by {triggered_by}"
+                        ),
+                    )
+                elif ch_type == "voice":
+                    await guild.create_voice_channel(
+                        name=ch_name,
+                        bitrate=min(ch_info.get("bitrate", 64000), 96000),
+                        user_limit=ch_info.get("user_limit", 0),
+                        reason=(
+                            f"[AntiRaid] Auto-restore — "
+                            f"triggered by {triggered_by}"
+                        ),
+                    )
+                elif ch_type == "category":
+                    await guild.create_category(
+                        name=ch_name,
+                        reason=(
+                            f"[AntiRaid] Auto-restore — "
+                            f"triggered by {triggered_by}"
+                        ),
+                    )
+
+                result["channels_restored"] += 1
+                log.info(f"  ✅ Channel restored: #{ch_name}")
+
+            except discord.Forbidden:
+                result["channels_failed"] += 1
+                log.warning(
+                    f"  ⚠️ Cannot restore #{ch_name} — missing permissions"
+                )
+            except Exception as e:
+                result["channels_failed"] += 1
+                log.error(f"  ❌ Failed to restore #{ch_name}: {e}")
+
+        # ── Step 3: Send summary embed to first available channel
+        summary_lines = [
+            f"🔄 **Auto-restore complete** — triggered by `{triggered_by}`",
+            f"📸 Snapshot age: {snapshot_age:.0f}s",
+            f"✅ Roles restored: **{result['roles_restored']}**",
+            f"✅ Channels restored: **{result['channels_restored']}**",
+        ]
+        if result["roles_failed"] or result["channels_failed"]:
+            summary_lines.append(
+                f"⚠️ Failed: {result['roles_failed']} roles, "
+                f"{result['channels_failed']} channels"
+            )
+
+        summary = "\n".join(summary_lines)
+        log.warning(summary.replace("**", "").replace("`", ""))
+
+        target_channel = None
+        for ch in guild.text_channels:
+            if guild.me.permissions_in(ch).send_messages:
+                target_channel = ch
+                break
+
+        if target_channel:
+            try:
+                embed = discord.Embed(
+                    title="🛡️ AntiRaid — Auto-Restore Complete",
+                    description=summary,
+                    color=discord.Color.green(),
+                )
+                embed.set_footer(text=f"Triggered by: {triggered_by}")
+                await target_channel.send(embed=embed)
+            except Exception:
+                pass  # Never fail the restore if alert send fails
+
+        return result
+
+    # ══════════════════════════════════════════════════════════════
     #  Helper: Fetch the latest snapshot for a guild
     # ══════════════════════════════════════════════════════════════
 
