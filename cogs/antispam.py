@@ -345,10 +345,10 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             # Only scan URLs that are not on the trusted safelist
             unknown_urls = [u for u in all_urls if not _is_safe_domain(u)]
 
-            for url in unknown_urls[:3]:
+            for url in unknown_urls[:5]:
                 try:
                     vt_score = await check_virustotal(url)
-                    if vt_score > 0:
+                    if vt_score >= 2:
                         flagged_urls.append(url)
                 except asyncio.TimeoutError:
                     logger.warning(
@@ -401,8 +401,7 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                     f"in #{message.channel.name}"
                 )
                 await self._auto_mute(
-                    member=member,
-                    guild=message.guild,
+                    member,
                     reason="Unauthorized Discord invite link",
                 )
                 await self._send_alert(

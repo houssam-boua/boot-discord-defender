@@ -21,6 +21,7 @@ logger = logging.getLogger("antiraid.linkscanner")
 
 # In-memory cache — loaded from DB on startup, updated on !link-add
 _domain_cache: set[str] = set(PHISHING_DOMAINS)
+_clean_domain_cache: set[str] = set()
 
 # Singleton aiohttp session to prevent resource leaks.
 _session: aiohttp.ClientSession | None = None
@@ -84,6 +85,17 @@ async def load_cache_from_db(pool) -> None:
     """
     rows = await pool.fetch("SELECT domain FROM malicious_links")
     _domain_cache.update(row["domain"] for row in rows)
+    # Also preload recently-scanned clean domains into RAM
+    clean_rows = await pool.fetch(
+        """SELECT domain FROM vt_scan_cache
+           WHERE is_malicious = FALSE
+             AND (expires_at IS NULL OR expires_at > NOW())"""
+    )
+    for row in clean_rows:
+        _clean_domain_cache.add(row["domain"])
+    logger.info(
+        f"✅ VT clean cache preloaded — {len(_clean_domain_cache)} clean domains in RAM"
+    )
     logger.info(
         f"✅ Link scanner cache loaded — {len(_domain_cache)} domains tracked"
     )
@@ -151,7 +163,7 @@ def extract_urls(content: str) -> list[str]:
 
 # Minimum number of VT engines that must flag a URL as malicious.
 # Set to 3 to avoid false positives from single-engine flags.
-VT_MALICIOUS_THRESHOLD = 3
+VT_MALICIOUS_THRESHOLD = 2
 
 # VT free tier: 4 lookups per minute, 500 per day
 VT_RATE_LIMIT = 4
@@ -187,12 +199,20 @@ async def check_virustotal(url: str) -> int:
     if not domain:
         return 0
 
+    # Fast RAM check for known-clean domains
+    if domain in _clean_domain_cache:
+        logger.debug(f"VT RAM cache HIT (clean): {domain}")
+        return 0
+
     # ── Step 2: Check DB cache (vt_scan_cache) ─────────────────
     # This catches BOTH previously-clean and previously-malicious domains
     if _pool:
         try:
             cached = await _pool.fetchrow(
-                "SELECT is_malicious, positives FROM vt_scan_cache WHERE domain = $1",
+                """SELECT is_malicious, positives
+                   FROM vt_scan_cache
+                   WHERE domain = $1
+                     AND (expires_at IS NULL OR expires_at > NOW())""",
                 domain,
             )
             if cached:
@@ -323,19 +343,32 @@ async def _cache_vt_result(domain: str, *, is_malicious: bool, positives: int) -
     if not _pool:
         return
     try:
+        from datetime import timedelta as _td
+        expiry_days = 30 if is_malicious else 7
         await _pool.execute(
             """
-            INSERT INTO vt_scan_cache (domain, is_malicious, positives)
-            VALUES ($1, $2, $3)
+            INSERT INTO vt_scan_cache
+                (domain, is_malicious, positives, expires_at)
+            VALUES ($1, $2, $3, NOW() + $4)
             ON CONFLICT (domain) DO UPDATE
                 SET is_malicious = $2,
-                    positives = $3,
-                    scanned_at = NOW()
+                    positives    = $3,
+                    scanned_at   = NOW(),
+                    expires_at   = NOW() + $4
             """,
             domain,
             is_malicious,
             positives,
+            _td(days=expiry_days),
         )
+
+        if is_malicious:
+            _domain_cache.add(domain)
+            _clean_domain_cache.discard(domain)
+        else:
+            _clean_domain_cache.add(domain)
+            _domain_cache.discard(domain)
+
     except Exception as e:
         logger.debug(f"Failed to cache VT result for {domain}: {e}")
 
