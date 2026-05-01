@@ -603,50 +603,35 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
         return data
 
     # ══════════════════════════════════════════════════════════════
-    #  !restore-roles — Recreate missing roles from snapshot
+    #  !restore — Recreate missing roles/channels from snapshot
     # ══════════════════════════════════════════════════════════════
 
     @commands.command(
-        name="restore-roles",
-        aliases=["restoreroles"],
-        help="Restore missing roles from the latest server snapshot.",
+        name="restore",
+        aliases=[
+            "restore-roles",
+            "restore-channels",
+            "restoreroles",
+            "restorechannels",
+        ],
+        help="Full server restore — roles, channels, and member role assignments.",
     )
     @is_staff()
-    async def restore_roles(self, ctx: commands.Context) -> None:
-        """Restore missing roles AND re-assign member roles from snapshot."""
+    async def restore(self, ctx: commands.Context) -> None:
+        """
+        Full server restore from latest snapshot.
+        Restores roles, channels, and re-assigns member roles.
+        All previous aliases (!restore-roles, !restore-channels) still work.
+        """
         await ctx.send(
-            "🔄 Running full restore from snapshot "
+            f"🔄 Running full restore from snapshot "
             f"(triggered by {ctx.author})…"
         )
         await self.restore_from_snapshot(
             ctx.guild,
-            triggered_by=f"manual:restore-roles:{ctx.author.id}",
+            triggered_by=f"manual:restore:{ctx.author.id}",
         )
-        # restore_from_snapshot already sends the summary embed to
-        # the first available channel — no second embed needed here.
-
-    # ══════════════════════════════════════════════════════════════
-    #  !restore-channels — Recreate missing channels from snapshot
-    # ══════════════════════════════════════════════════════════════
-
-    @commands.command(
-        name="restore-channels",
-        aliases=["restorechannels"],
-        help="Restore missing channels from the latest server snapshot.",
-    )
-    @is_staff()
-    async def restore_channels(self, ctx: commands.Context) -> None:
-        """Restore missing channels, roles AND member roles from snapshot."""
-        await ctx.send(
-            "🔄 Running full restore from snapshot "
-            f"(triggered by {ctx.author})…"
-        )
-        await self.restore_from_snapshot(
-            ctx.guild,
-            triggered_by=f"manual:restore-channels:{ctx.author.id}",
-        )
-        # restore_from_snapshot already sends the summary embed to
-        # the first available channel — no second embed needed here.
+        # restore_from_snapshot sends the summary embed — no second message needed.
 
     # ══════════════════════════════════════════════════════════════
     #  Live Snapshot Engine — Debounced to prevent DB/API exhaustion
