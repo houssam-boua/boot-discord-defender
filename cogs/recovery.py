@@ -155,10 +155,30 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
             channels_data.append(channel_info)
 
+        # ── Serialize Member Role Assignments ─────────────────
+        members_data = []
+        if guild.members:
+            for member in guild.members:
+                if member.bot:
+                    continue  # Skip bots — their roles are OAuth2-managed
+                role_ids = [r.id for r in member.roles if not r.is_default()]
+                if role_ids:  # Only save members who have at least one role
+                    members_data.append({
+                        "user_id": member.id,
+                        "username": str(member),   # For debugging only
+                        "role_ids": role_ids,       # List of role IDs they had
+                    })
+        else:
+            logger.warning(
+                f"⚠️ Member cache empty for {guild.name} — "
+                f"member role snapshot skipped (check GUILD_MEMBERS intent)"
+            )
+
         # ── Build snapshot JSON ────────────────────────────────
         snapshot = {
             "roles": roles_data,
             "channels": channels_data,
+            "members": members_data,
             "guild_name": guild.name,
             "member_count": guild.member_count,
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -177,7 +197,8 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
 
         logger.info(
             f"📸 Snapshot saved: {guild.name} — "
-            f"{len(roles_data)} roles, {len(channels_data)} channels"
+            f"{len(roles_data)} roles, {len(channels_data)} channels, "
+            f"{len(members_data)} members"
         )
 
     # ══════════════════════════════════════════════════════════════
@@ -271,6 +292,8 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
             "channels_restored": 0,
             "roles_failed": 0,
             "channels_failed": 0,
+            "members_reassigned": 0,
+            "members_failed": 0,
             "snapshot_age_seconds": 0.0,
         }
 
@@ -324,6 +347,7 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
             
         roles_data    = data.get("roles", [])
         channels_data = data.get("channels", [])
+        members_data  = data.get("members", [])
 
         log.warning(
             f"🔄 AUTO-RESTORE triggered in {guild.name} ({guild.id}) "
@@ -439,17 +463,95 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
                 result["channels_failed"] += 1
                 log.error(f"  ❌ Failed to restore #{ch_name}: {e}")
 
-        # ── Step 3: Send summary embed to first available channel
+        # ── Step 3: Re-assign Member Roles ───────────────────
+        if members_data:
+            log.warning(
+                f"👥 Re-assigning roles to {len(members_data)} members "
+                f"in {guild.name}…"
+            )
+
+            # Build a map: old_role_id → role_name (from snapshot)
+            # Then: role_name → new Role object (from live guild)
+            # IDs change after recreation — ALWAYS match by NAME
+            old_id_to_name: dict[int, str] = {
+                r["id"]: r["name"]
+                for r in roles_data
+                if "id" in r and "name" in r
+            }
+            name_to_new_role: dict[str, discord.Role] = {
+                r.name: r for r in guild.roles
+            }
+
+            for member_info in members_data:
+                user_id  = member_info.get("user_id")
+                role_ids = member_info.get("role_ids", [])
+
+                if not user_id or not role_ids:
+                    continue
+
+                member = guild.get_member(user_id)
+                if not member:
+                    continue  # Member left the server — skip silently
+
+                roles_to_add = []
+                for old_id in role_ids:
+                    role_name = old_id_to_name.get(old_id)
+                    if not role_name:
+                        continue
+                    new_role = name_to_new_role.get(role_name)
+                    if new_role and new_role not in member.roles:
+                        roles_to_add.append(new_role)
+
+                if not roles_to_add:
+                    continue
+
+                try:
+                    await member.add_roles(
+                        *roles_to_add,
+                        reason=(
+                            f"[AntiRaid] Auto role re-assignment — "
+                            f"triggered by {triggered_by}"
+                        ),
+                        atomic=False,
+                    )
+                    result["members_reassigned"] += 1
+                    log.info(
+                        f"  ✅ Roles re-assigned to {member} "
+                        f"({len(roles_to_add)} roles)"
+                    )
+                    # Rate-limit: Discord allows ~5 role edits/sec
+                    await asyncio.sleep(0.3)
+
+                except discord.Forbidden:
+                    result["members_failed"] += 1
+                    log.warning(
+                        f"  ⚠️ Cannot re-assign roles to {member} "
+                        f"— missing permissions"
+                    )
+                except Exception as e:
+                    result["members_failed"] += 1
+                    log.error(
+                        f"  ❌ Failed to re-assign roles to {member}: {e}"
+                    )
+        else:
+            log.warning(
+                "👥 No member role data in snapshot — "
+                "re-assignment skipped (snapshot taken before this feature)"
+            )
+
+        # ── Step 4: Send summary embed to first available channel
         summary_lines = [
             f"🔄 **Auto-restore complete** — triggered by `{triggered_by}`",
             f"📸 Snapshot age: {snapshot_age:.0f}s",
             f"✅ Roles restored: **{result['roles_restored']}**",
             f"✅ Channels restored: **{result['channels_restored']}**",
+            f"👥 Members re-assigned: **{result['members_reassigned']}**",
         ]
-        if result["roles_failed"] or result["channels_failed"]:
+        if result["roles_failed"] or result["channels_failed"] or result["members_failed"]:
             summary_lines.append(
                 f"⚠️ Failed: {result['roles_failed']} roles, "
-                f"{result['channels_failed']} channels"
+                f"{result['channels_failed']} channels, "
+                f"{result['members_failed']} members"
             )
 
         summary = "\n".join(summary_lines)
