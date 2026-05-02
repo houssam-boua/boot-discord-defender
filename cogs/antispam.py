@@ -461,6 +461,16 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                     # Re-attempt timeout now that admin roles are gone
                     muted = await self._auto_mute(member, reason=mute_reason)
 
+            # ── DM user with appeal instructions ──────────────
+            if muted:
+                from cogs.appeals import send_appeal_dm
+                await send_appeal_dm(
+                    member,
+                    guild_name=message.guild.name,
+                    punishment_type="muted",
+                    reason=mute_reason,
+                )
+
             # ── Build action summary ───────────────────────────────
             action_parts = ["Message deleted"]
             if muted:
@@ -530,10 +540,18 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                     f"Invite link blocked from {member} ({member.id}) "
                     f"in #{message.channel.name}"
                 )
-                await self._auto_mute(
+                muted_invite = await self._auto_mute(
                     member,
                     reason="Unauthorized Discord invite link",
                 )
+                if muted_invite:
+                    from cogs.appeals import send_appeal_dm
+                    await send_appeal_dm(
+                        member,
+                        guild_name=message.guild.name,
+                        punishment_type="muted",
+                        reason="Unauthorized Discord invite link",
+                    )
                 await self._send_alert(
                     guild=message.guild,
                     title="🔗 Invite Link Blocked",
@@ -560,6 +578,14 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                 member,
                 reason=f"Mass mentions ({total_mentions} pings, limit: {max_mentions})",
             )
+            if muted:
+                from cogs.appeals import send_appeal_dm
+                await send_appeal_dm(
+                    member,
+                    guild_name=message.guild.name,
+                    punishment_type="muted",
+                    reason=f"Mass mentions ({total_mentions} pings, limit: {max_mentions})",
+                )
 
             logger.warning(
                 f"📢 Mass mention from {member} ({member.id}): "
@@ -639,6 +665,17 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                     f"in {config['spam_msg_seconds']}s)"
                 ),
             )
+            if muted:
+                from cogs.appeals import send_appeal_dm
+                await send_appeal_dm(
+                    member,
+                    guild_name=message.guild.name,
+                    punishment_type="muted",
+                    reason=(
+                        f"Message flood ({config['spam_msg_limit']}+ msgs "
+                        f"in {config['spam_msg_seconds']}s)"
+                    ),
+                )
 
             logger.warning(
                 f"🌊 Flood detected from {member} ({member.id}) in "

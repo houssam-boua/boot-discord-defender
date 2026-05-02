@@ -235,6 +235,24 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
                 f"🔨 BANNED nuke actor {actor} ({actor.id}) "
                 f"in {guild.name} after role strip"
             )
+            try:
+                # DM before ban so the user still has a path to appeal
+                user_obj = self.bot.get_user(actor.id)
+                if not user_obj:
+                    try:
+                        user_obj = await self.bot.fetch_user(actor.id)
+                    except Exception:
+                        user_obj = None
+                if user_obj:
+                    from cogs.appeals import send_appeal_dm
+                    await send_appeal_dm(
+                        user_obj,
+                        guild_name=guild.name,
+                        punishment_type="banned",
+                        reason=f"Anti-nuke triggered ({action_type})",
+                    )
+            except Exception:
+                pass  # DM failure never blocks the ban
         except discord.Forbidden:
             logger.error(
                 f"❌ Cannot ban {actor} ({actor.id}) — bot role too low"
