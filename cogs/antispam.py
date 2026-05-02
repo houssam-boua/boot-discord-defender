@@ -26,7 +26,7 @@ INVITE_RE = re.compile(
     re.IGNORECASE,
 )
 from utils.rate_limit import check_spam
-from services.linkscanner import scan_message_urls
+from services.linkscanner import scan_message_urls, is_known_malicious
 
 logger = logging.getLogger("antiraid.antispam")
 
@@ -405,6 +405,35 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
                     logger.warning(
                         f"⚠️ VT scan error for {url}: {e} — leaving message"
                     )
+
+        # ── CHECK 2b: Scan embed URLs ──────────────────────────
+        if not flagged_urls and message.embeds:
+            for embed in message.embeds:
+                for url in filter(None, [
+                    embed.url,
+                    embed.thumbnail.url if embed.thumbnail else None,
+                    embed.image.url if embed.image else None,
+                ]):
+                    if _is_safe_domain(url):
+                        continue
+                    if is_known_malicious(url):
+                        flagged_urls.append(url)
+                    else:
+                        try:
+                            vt_score = await check_virustotal(url)
+                            if vt_score >= 2:
+                                flagged_urls.append(url)
+                        except Exception:
+                            pass
+
+        # ── CHECK 2c: Scan attachment filenames/URLs ────────────
+        if not flagged_urls and message.attachments:
+            for att in message.attachments:
+                if not _is_safe_domain(att.url) and is_known_malicious(att.url):
+                    flagged_urls.append(att.url)
+                for url in re.findall(r'https?://\S+', att.filename):
+                    if not _is_safe_domain(url) and is_known_malicious(url):
+                        flagged_urls.append(url)
 
         if flagged_urls:
             await _safe_delete(message, reason="Malicious link")
