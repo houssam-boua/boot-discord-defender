@@ -633,6 +633,91 @@ class Recovery(commands.Cog, name="🔄 Recovery"):
         )
         # restore_from_snapshot sends the summary embed — no second message needed.
 
+    @commands.command(
+        name="restore-member",
+        aliases=["restoremember", "restore-admin"],
+        help="Re-assign stripped roles to a member from the audit log.",
+    )
+    @is_staff()
+    async def restore_member(
+        self, ctx: commands.Context, member: discord.Member
+    ) -> None:
+        """Re-assign the most recently stripped roles to a member."""
+        row = await self.bot.db.pool.fetchrow(
+            """
+            SELECT stripped_role_ids, stripped_role_names,
+                   stripped_at, reason
+            FROM admin_role_strips
+            WHERE guild_id = $1 AND user_id = $2
+            ORDER BY stripped_at DESC
+            LIMIT 1
+            """,
+            ctx.guild.id,
+            member.id,
+        )
+
+        if not row:
+            await ctx.send(
+                f"❌ No stripped role record found for {member.mention}."
+            )
+            return
+
+        role_ids   = row["stripped_role_ids"]
+        role_names = row["stripped_role_names"]
+        stripped_at = row["stripped_at"]
+        reason     = row["reason"]
+
+        roles_to_restore = []
+        missing_names    = []
+
+        for rid, rname in zip(role_ids, role_names):
+            role = ctx.guild.get_role(rid)
+            if not role:
+                role = discord.utils.get(ctx.guild.roles, name=rname)
+            if role:
+                roles_to_restore.append(role)
+            else:
+                missing_names.append(rname)
+
+        if not roles_to_restore:
+            await ctx.send(
+                f"❌ None of the stripped roles exist anymore: "
+                f"{', '.join(role_names)}"
+            )
+            return
+
+        try:
+            await member.add_roles(
+                *roles_to_restore,
+                reason=(
+                    f"[AntiRaid] Manual role restore by {ctx.author} — "
+                    f"originally stripped: {reason}"
+                ),
+                atomic=False,
+            )
+            restored = ", ".join(f"`{r.name}`" for r in roles_to_restore)
+            msg = (
+                f"✅ Restored {len(roles_to_restore)} role(s) to "
+                f"{member.mention}: {restored}\n"
+                f"📅 Originally stripped: "
+                f"{stripped_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"📝 Reason: {reason}"
+            )
+            if missing_names:
+                msg += (
+                    f"\n⚠️ These roles no longer exist: "
+                    f"{', '.join(missing_names)}"
+                )
+            await ctx.send(msg)
+
+        except discord.Forbidden:
+            await ctx.send(
+                f"❌ Missing permissions to restore roles for "
+                f"{member.mention}."
+            )
+        except Exception as e:
+            await ctx.send(f"❌ Failed to restore roles: {e}")
+
     # ══════════════════════════════════════════════════════════════
     #  Live Snapshot Engine — Debounced to prevent DB/API exhaustion
     # ══════════════════════════════════════════════════════════════
