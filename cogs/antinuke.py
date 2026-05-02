@@ -222,6 +222,26 @@ class AntiNuke(commands.Cog, name="🛡️ Anti-Nuke"):
                 except discord.HTTPException as e:
                     logger.error(f"❌ Role strip failed: {e}")
 
+        try:
+            await guild.ban(
+                actor,
+                reason=(
+                    f"[AntiRaid] Nuke detected ({action_type}) — "
+                    f"auto-banned after role strip"
+                ),
+                delete_message_days=1,
+            )
+            logger.warning(
+                f"🔨 BANNED nuke actor {actor} ({actor.id}) "
+                f"in {guild.name} after role strip"
+            )
+        except discord.Forbidden:
+            logger.error(
+                f"❌ Cannot ban {actor} ({actor.id}) — bot role too low"
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to ban nuke actor {actor}: {e}")
+
         # ── Log to audit_logs (ALWAYS) ─────────────────────────
         if self.bot.db.pool:
             await insert_audit_log(
