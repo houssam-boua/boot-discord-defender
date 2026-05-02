@@ -574,6 +574,35 @@ class AntiSpam(commands.Cog, name="🛡️ Anti-Spam"):
             # Delete the message that triggered the flood threshold
             await _safe_delete(message, reason="Message flood")
 
+            # Bulk-delete the member's recent spam messages
+            try:
+                def is_flood_msg(m: discord.Message) -> bool:
+                    return (
+                        m.author.id == member.id
+                        and m.id != message.id
+                    )
+                spam_msgs = [
+                    m async for m in message.channel.history(limit=50)
+                    if is_flood_msg(m)
+                ][:9]   # up to 9 more + 1 triggering = 10 total
+                if spam_msgs:
+                    await message.channel.delete_messages(
+                        spam_msgs,
+                        reason=f"[AntiRaid] Flood cleanup — {member}",
+                    )
+                    logger.info(
+                        f"🧹 Bulk-deleted {len(spam_msgs)} flood messages "
+                        f"from {member} ({member.id}) in "
+                        f"#{message.channel.name}"
+                    )
+            except discord.Forbidden:
+                logger.warning(
+                    f"⚠️ Cannot bulk-delete flood messages in "
+                    f"#{message.channel.name} — missing permissions"
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Flood cleanup failed: {e}")
+
             muted = await self._auto_mute(
                 member,
                 reason=(
