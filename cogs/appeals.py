@@ -58,11 +58,16 @@ class AppealsView(discord.ui.View):
         super().__init__(timeout=None)
         self.appeal_id = appeal_id
         self.bot = bot
+        for child in self.children:
+            if child.label == "✅ Approve":
+                child.custom_id = f"appeal_approve:{appeal_id}"
+            elif child.label == "❌ Deny":
+                child.custom_id = f"appeal_deny:{appeal_id}"
 
     @discord.ui.button(
         label="✅ Approve",
         style=discord.ButtonStyle.success,
-        custom_id="appeal_approve",
+        custom_id="appeal_approve:0",
     )
     async def approve(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -72,7 +77,7 @@ class AppealsView(discord.ui.View):
     @discord.ui.button(
         label="❌ Deny",
         style=discord.ButtonStyle.danger,
-        custom_id="appeal_deny",
+        custom_id="appeal_deny:0",
     )
     async def deny(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -85,6 +90,9 @@ class AppealsView(discord.ui.View):
         approved: bool,
     ) -> None:
         """Shared logic for both buttons."""
+        appeal_id = int(interaction.data["custom_id"].split(":")[1])
+        self.appeal_id = appeal_id
+
         # Fetch appeal from DB
         row = await self.bot.db.pool.fetchrow(
             "SELECT * FROM appeals WHERE id = $1", self.appeal_id
@@ -224,6 +232,20 @@ class Appeals(commands.Cog, name="⚖️ Appeals"):
 
     async def cog_load(self) -> None:
         """Start the appeal expiry scheduler."""
+        if self.bot.db.pool:
+            try:
+                rows = await self.bot.db.pool.fetch(
+                    "SELECT id FROM appeals WHERE status = 'pending'"
+                )
+                for row in rows:
+                    view = AppealsView(appeal_id=row["id"], bot=self.bot)
+                    self.bot.add_view(view)
+                logger.info(
+                    f"✅ Re-registered {len(rows)} pending appeal view(s)"
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to re-register appeal views: {e}")
+
         from services.punishment_scheduler import scheduler as shared_scheduler
         shared_scheduler.add_job(
             self._expire_old_appeals,
