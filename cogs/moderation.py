@@ -529,14 +529,40 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
 
         # Execute full purge
         try:
-            deleted = await channel.purge(
-                limit=None,
-                reason=f"[AntiRaid] !purge-all by {ctx.author}",
-            )
-            logger.info(
-                f"🧹 !purge-all: {len(deleted)} messages deleted in "
-                f"#{channel.name} by {ctx.author} ({ctx.author.id})"
-            )
+            from datetime import datetime, timezone, timedelta
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=13)
+            # Use 13 days not 14 — small safety buffer for clock skew
+
+            progress_msg = await ctx.send("🧹 Purging messages...")
+
+            deleted_count = 0
+            skipped_old   = 0
+
+            async for batch in _chunked_history(channel, chunk_size=100):
+                recent = [m for m in batch if m.created_at > cutoff]
+                old    = [m for m in batch if m.created_at <= cutoff]
+
+                if recent:
+                    try:
+                        if len(recent) == 1:
+                            await recent[0].delete()
+                        else:
+                            await channel.delete_messages(
+                                recent,
+                                reason=f"[AntiRaid] !purge-all by {ctx.author}",
+                            )
+                        deleted_count += len(recent)
+                    except discord.HTTPException:
+                        pass
+
+                skipped_old += len(old)
+
+                # Stop fetching once we hit old messages — no point scanning further
+                if old:
+                    break
+
+            await progress_msg.delete()
         except discord.Forbidden:
             await ctx.send(
                 "❌ Missing `Manage Messages` permission to purge this channel."
@@ -550,9 +576,13 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
         embed = discord.Embed(
             title="🧹 Channel Wiped",
             description=(
-                f"**{len(deleted)}** messages deleted from {channel.mention}.\n"
+                f"**{deleted_count}** message(s) deleted from {channel.mention}.\n"
                 f"**Executed by:** {ctx.author.mention}\n"
-                f"**Reason:** Manual full-channel purge"
+                + (
+                    f"\n⚠️ **{skipped_old}** message(s) older than 14 days were "
+                    f"skipped — Discord does not allow bulk-deleting old messages."
+                    if skipped_old else ""
+                )
             ),
             color=discord.Color.orange(),
         )
@@ -1203,6 +1233,25 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
         )
         await ctx.send(embed=embed)
 
+
+# ── Helpers ───────────────────────────────────────────────────────
+async def _chunked_history(channel, chunk_size: int = 100):
+    """
+    Async generator that yields message history in chunks of chunk_size.
+    Used to batch bulk_delete calls efficiently.
+    """
+    last_id = None
+    while True:
+        kwargs = {"limit": chunk_size}
+        if last_id:
+            kwargs["before"] = discord.Object(id=last_id)
+        batch = [m async for m in channel.history(**kwargs)]
+        if not batch:
+            break
+        yield batch
+        last_id = batch[-1].id
+        if len(batch) < chunk_size:
+            break
 
 # ── Cog Setup (required for dynamic loading) ──────────────────
 async def setup(bot: commands.Bot) -> None:
