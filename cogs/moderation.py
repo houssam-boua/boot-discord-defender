@@ -490,6 +490,75 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
             f"across all channels by {ctx.author}"
         )
 
+    @commands.command(
+        name="purge-all",
+        aliases=["purgeall", "wipe-channel", "wipechannel"],
+        help="Delete ALL messages in the current channel.",
+    )
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def purge_all(self, ctx: commands.Context) -> None:
+        """
+        Wipe every message in the current channel.
+        Uses channel.purge() with no limit cap — processes in
+        100-message batches automatically (Discord API max per call).
+        Sends a confirmation embed after completion.
+        """
+        channel = ctx.channel
+
+        # Confirmation gate — prevent accidental wipes
+        confirm_msg = await ctx.send(
+            f"⚠️ This will delete **ALL messages** in {channel.mention}.\n"
+            f"Type `CONFIRM` within 15 seconds to proceed."
+        )
+
+        def check(m):
+            return (
+                m.author == ctx.author
+                and m.channel == channel
+                and m.content.strip().upper() == "CONFIRM"
+            )
+
+        try:
+            await self.bot.wait_for("message", check=check, timeout=15.0)
+        except asyncio.TimeoutError:
+            await confirm_msg.edit(
+                content="❌ `!purge-all` cancelled — no confirmation received."
+            )
+            return
+
+        # Execute full purge
+        try:
+            deleted = await channel.purge(
+                limit=None,
+                reason=f"[AntiRaid] !purge-all by {ctx.author}",
+            )
+            logger.info(
+                f"🧹 !purge-all: {len(deleted)} messages deleted in "
+                f"#{channel.name} by {ctx.author} ({ctx.author.id})"
+            )
+        except discord.Forbidden:
+            await ctx.send(
+                "❌ Missing `Manage Messages` permission to purge this channel."
+            )
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Purge failed: {e}")
+            return
+
+        # Post completion summary (this message won't be deleted — sent after purge)
+        embed = discord.Embed(
+            title="🧹 Channel Wiped",
+            description=(
+                f"**{len(deleted)}** messages deleted from {channel.mention}.\n"
+                f"**Executed by:** {ctx.author.mention}\n"
+                f"**Reason:** Manual full-channel purge"
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text=f"Guild: {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
     # ══════════════════════════════════════════════════════════════
     #  !lockdown
     # ══════════════════════════════════════════════════════════════
