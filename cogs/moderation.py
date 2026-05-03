@@ -562,7 +562,10 @@ class Moderation(commands.Cog, name="🔨 Moderation"):
                 if old:
                     break
 
-            await progress_msg.delete()
+            try:
+                await progress_msg.delete()
+            except discord.NotFound:
+                pass  # already deleted by the purge itself — safe to ignore
         except discord.Forbidden:
             await ctx.send(
                 "❌ Missing `Manage Messages` permission to purge this channel."
